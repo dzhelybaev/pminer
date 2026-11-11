@@ -84,7 +84,12 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
 // Блок 128×128, 4 warp по 64×64, шаг K 64 байта, 2 стадии smem.
 // Поток warp держит 4×8 фрагментов m16n8 = 128 аккумуляторов = ровно один тайл
 // rows {g+8a}, cols {2(l%4)+8b+{0,1}} — шаблоны ROWS/COLS_PATTERN из pearl.h.
-static constexpr int BM = 128, BN = 128, BK = 64, NTHR = 128;
+static constexpr int BM = 128, BN = 128, BK = 64, NTHR = 128, GROUP_M = 8;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+static constexpr int STAGES = 2;  // Turing: синхронные загрузки
+#else
+static constexpr int STAGES = 3;  // cp.async, 3×16 КБ = 48 КБ static smem
+#endif
 
 struct Hit { uint32_t row0, col0; };
 
@@ -104,9 +109,9 @@ __device__ __forceinline__ void cp_commit() {
   asm volatile("cp.async.commit_group;\n");
 #endif
 }
-__device__ __forceinline__ void cp_wait1() {
+template <int N> __device__ __forceinline__ void cp_wait() {
 #if __CUDA_ARCH__ >= 800
-  asm volatile("cp.async.wait_group 1;\n");
+  asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 #endif
 }
 
@@ -147,15 +152,20 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int k, int
 }
 
 // A' (m×k), B'^T (n×k): int8, k-непрерывные. k кратно BK, r кратно BK.
+// Сетка одномерная, порядок блоков сгруппирован по GROUP_M строк блоков —
+// одновременно работающие блоки делят панели A и B в L2.
 __global__ void __launch_bounds__(NTHR)
-k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int k, int r,
+k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
-  __shared__ __align__(128) int8_t sA[2][BM * BK];
-  __shared__ __align__(128) int8_t sB[2][BN * BK];
+  __shared__ __align__(128) int8_t sA[STAGES][BM * BK];
+  __shared__ __align__(128) int8_t sB[STAGES][BN * BK];
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
   const int wm = (warp >> 1) * 64, wn = (warp & 1) * 64;
-  const int8_t *gA = A + (size_t)blockIdx.y * BM * k;
-  const int8_t *gB = Bt + (size_t)blockIdx.x * BN * k;
+  const int nbm = m / BM, nbn = n / BN, gsz = GROUP_M * nbn, pid = blockIdx.x;
+  const int first = (pid / gsz) * GROUP_M, gs = min(nbm - first, GROUP_M), loc = pid % gsz;
+  const int bm = first + loc % gs, bn = loc / gs;
+  const int8_t *gA = A + (size_t)bm * BM * k;
+  const int8_t *gB = Bt + (size_t)bn * BN * k;
 
   int acc[4][8][4];
 #pragma unroll
@@ -169,24 +179,26 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int k, int r
   for (int i = 0; i < 16; i++) jp[i] = 0;
 
   const int KT = k / BK, per_chunk = r / BK;
-  load_tile(sA[0], gA, k, t);
-  load_tile(sB[0], gB, k, t);
-  cp_commit();
+#pragma unroll
+  for (int s = 0; s < STAGES - 1; s++) {
+    if (s < KT) { load_tile(sA[s], gA + s * BK, k, t); load_tile(sB[s], gB + s * BK, k, t); }
+    cp_commit();
+  }
 
   // адреса ldmatrix: A — строка (lane%8)+8*((lane/8)%2), сегмент lane/16;
   //                  B — строка (lane%8)+8*(lane/16),    сегмент (lane/8)%2
   const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_seg = lane >> 4;
   const int b_row = (lane & 7) + 8 * (lane >> 4), b_seg = (lane >> 3) & 1;
 
+  int st = 0;
   for (int kt = 0; kt < KT; kt++) {
-    const int st = kt & 1;
-    if (kt + 1 < KT) {
-      load_tile(sA[st ^ 1], gA + (kt + 1) * BK, k, t);
-      load_tile(sB[st ^ 1], gB + (kt + 1) * BK, k, t);
+    cp_wait<STAGES - 2>();
+    __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
+    {
+      int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
+      if (nk < KT) { load_tile(sA[ns], gA + nk * BK, k, t); load_tile(sB[ns], gB + nk * BK, k, t); }
+      cp_commit();
     }
-    cp_commit();
-    cp_wait1();
-    __syncthreads();
 #pragma unroll
     for (int ks = 0; ks < 2; ks++) {  // два шага k32 в стадии
       uint32_t af[4][4], bf[8][2];
@@ -215,22 +227,22 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int k, int r
       for (int i = 0; i < 15; i++) jp[i] = jp[i + 1];
       jp[15] = nv;
     }
-    __syncthreads();
+    st = st == STAGES - 1 ? 0 : st + 1;
   }
 
   // позиция i после N сдвигов хранит слово (i+N)%16
   const int nch = k / r;
-  uint32_t m[16];
+  uint32_t msg[16];
 #pragma unroll
-  for (int i = 0; i < 16; i++) m[i] = 0;
+  for (int i = 0; i < 16; i++) msg[i] = 0;
 #pragma unroll
   for (int i = 0; i < 16; i++) {
     int idx = (i + nch) & 15;
 #pragma unroll
-    for (int q = 0; q < 16; q++) if (q == idx) m[q] = jp[i];
+    for (int q = 0; q < 16; q++) if (q == idx) msg[q] = jp[i];
   }
   uint32_t h[8];
-  b3::compress(a_seed.w, m, 0, 64, SINGLE_KEYED, h);
+  b3::compress(a_seed.w, msg, 0, 64, SINGLE_KEYED, h);
   bool le = true;  // h (LE 256 бит) <= bnd
 #pragma unroll
   for (int w = 7; w >= 0; w--) {
@@ -243,8 +255,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int k, int r
   if (le) {
     unsigned i = atomicAdd(hit_count, 1u);
     if ((int)i < max_hits) {
-      hits[i].row0 = blockIdx.y * BM + wm + (lane >> 2);
-      hits[i].col0 = blockIdx.x * BN + wn + 2 * (lane & 3);
+      hits[i].row0 = bm * BM + wm + (lane >> 2);
+      hits[i].col0 = bn * BN + wn + 2 * (lane & 3);
     }
   }
 }
