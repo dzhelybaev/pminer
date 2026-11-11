@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
@@ -403,7 +404,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
   struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; int gm = 0; };  // gm 0 — 1024/bm
   std::vector<Cand> cands;
-  // («n под волну» из v0.9 ни разу не выиграл — убран из перебора)
+  // («n под волну» в v0.9 не выиграл; в v0.22 вернулся — после устранения других тормозов)
   // {блок, m, n, полосы, ширина warp, конвейер}. Тайл 8×8 (v0.13) везде проигрывал — только --tile 8
   if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0, o.gm});
   else if (big_l2)
@@ -411,7 +412,19 @@ static void worker(Gpu *g, Opts o, int ngpu) {
              {128, 512, 4096, 2, 64, false, true}, {128, 1024, 4096, 2, 64, false, true},
              {128, 512, 4096, 2, 64, true, false}, {128, 1024, 4096, 2, 64, true, false},
              {128, 512, 4096, 2, 64, false, false}, {128, 2048, 2048, 1, 64, true, true}};
-  else
+  if (big_l2 && cands.size() > 1) {
+    // v0.22: n «под волну» — число блоков кратно 2·SM (2 блока на SM), последняя волна полная.
+    // Профиль ncu v0.21 (5060, m=512 n=4096: 128 блоков на 60 мест) — SM активны 86% времени запуска
+    const int slots = 2 * p.multiProcessorCount;
+    for (int mm : {512, 1024}) {
+      const int rows = mm / 128, L = slots / std::gcd(slots, rows);  // столбцов блоков кратно L
+      int cols = 32 / L * L;
+      if (cols == 0) cols = L;
+      if (cols * 128 == 4096 || cols * 128 > 8192) continue;
+      for (bool pp : {true, false}) cands.push_back({128, mm, cols * 128, 2, 64, pp, true});
+    }
+  }
+  if (!big_l2 && cands.empty())
     // v0.20: малый L2 (Turing) упирается в DRAM — перебор группы обхода gm (сколько строк блоков
     // идут рядом и делят панели B в L2)
     cands = {{128, 8192, 16384, 2, 64, false, false, 8}, {128, 8192, 16384, 2, 64, false, false, 2},
