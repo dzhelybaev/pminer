@@ -588,8 +588,37 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 // - 2 стадии по BK=64 (32 КБ smem на блок): 3 блока × 33 КБ влезают в 100 КБ SM (sm_86/89/120).
 // Смысл: у основного ядра 2 warp на планировщик, и простои (ожидание ldmatrix/барьера) нечем
 // закрыть; здесь их 3. Только sm_80+ (cp.async); на Turing smem SM 64 КБ — не помещается.
+// v0.27: mbarrier для sm_80+ (без __syncthreads в цикле k_gemm3<true>)
+__device__ __forceinline__ void mb_init(uint32_t bar, uint32_t count) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("mbarrier.init.shared.b64 [%0], %1;\n" ::"r"(bar), "r"(count) : "memory");
+#endif
+}
+__device__ __forceinline__ void mb_arrive(uint32_t bar) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("{\n\t.reg .b64 st;\n\tmbarrier.arrive.shared.b64 st, [%0];\n\t}\n" ::"r"(bar) : "memory");
+#endif
+}
+// прибытие потока, когда завершатся все его выданные cp.async (счётчик барьера не увеличивается)
+__device__ __forceinline__ void mb_cp_arrive(uint32_t bar) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("cp.async.mbarrier.arrive.noinc.shared.b64 [%0];\n" ::"r"(bar) : "memory");
+#endif
+}
+__device__ __forceinline__ void mb_wait(uint32_t bar, uint32_t parity) {
+#if __CUDA_ARCH__ >= 800
+  asm volatile("{\n\t.reg .pred P1;\n\tWAIT:\n\t"
+               "mbarrier.test_wait.parity.shared.b64 P1, [%0], %1;\n\t"
+               "@!P1 bra WAIT;\n\t}\n" ::"r"(bar), "r"(parity) : "memory");
+#endif
+}
+
 static constexpr int STAGES3 = 2;
 inline int gemm3_smem() { return STAGES3 * (128 + BN) * BK; }
+// MB (v0.27): вместо __syncthreads каждую итерацию — mbarrier на буфер: full (128 потоков, по
+// завершению их cp.async) и empty (4 warp, когда дочитали стадию). Warp ждут только своих данных и
+// освобождения буфера, могут уходить вперёд друг друга примерно на шаг.
+template <bool MB = false>
 __global__ void __launch_bounds__(128, 3)
 k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int gm,
         Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
@@ -629,20 +658,41 @@ k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int 
   const int aoff[2] = {sw(wm + a_row, a_seg), sw(wm + a_row, 2 + a_seg)};
   const int boff[2] = {sw(wn + b_row, b_seg), sw(wn + b_row, 2 + b_seg)};
 
+  __shared__ __align__(8) uint64_t mbars[4];  // full[2], empty[2]
+  const uint32_t fullb = smem_u32(mbars), emptyb = fullb + 16;
+  if constexpr (MB) {
+    if (t == 0) {
+      mb_init(fullb, NTHR); mb_init(fullb + 8, NTHR);
+      mb_init(emptyb, 4); mb_init(emptyb + 8, 4);
+    }
+    __syncthreads();
+  }
   load_tile<BM, NTHR>(sA(0) + loff, gA);
   load_tile<BN, NTHR>(sB(0) + loff, gB);
-  cp_commit();
+  if constexpr (MB) mb_cp_arrive(fullb);
+  else cp_commit();
   int st = 0;
 #pragma unroll 1
   for (int kt = 0; kt < KT; kt++) {
-    cp_wait<0>();
-    __syncthreads();  // стадия kt готова; буфер st^1 (стадия kt-1) все дочитали
     oA += pA; oB += pB;
-    if (kt + 1 < KT) {
-      load_tile<BM, NTHR>(sA(st ^ 1) + loff, gA + oA);
-      load_tile<BN, NTHR>(sB(st ^ 1) + loff, gB + oB);
+    if constexpr (MB) {
+      if (kt + 1 < KT) {
+        // буфер st^1 держал стадию kt-1: ждём, пока её дочитают все 4 warp
+        if (kt >= 1) mb_wait(emptyb + 8 * (st ^ 1), ((kt - 1) >> 1) & 1);
+        load_tile<BM, NTHR>(sA(st ^ 1) + loff, gA + oA);
+        load_tile<BN, NTHR>(sB(st ^ 1) + loff, gB + oB);
+        mb_cp_arrive(fullb + 8 * (st ^ 1));
+      }
+      mb_wait(fullb + 8 * st, (kt >> 1) & 1);  // стадия kt пришла (копии всех 128 потоков)
+    } else {
+      cp_wait<0>();
+      __syncthreads();  // стадия kt готова; буфер st^1 (стадия kt-1) все дочитали
+      if (kt + 1 < KT) {
+        load_tile<BM, NTHR>(sA(st ^ 1) + loff, gA + oA);
+        load_tile<BN, NTHR>(sB(st ^ 1) + loff, gB + oB);
+      }
+      cp_commit();
     }
-    cp_commit();
     // v0.26: слово jackpot читается из локальной памяти заранее (volatile — до ldmatrix), чтобы его
     // задержка ушла под mma; профиль v0.25: 2.5% простоев на rotl, ждавшем этой загрузки
     const bool chunk_end = (kt + 1) % per_chunk == 0;
@@ -664,6 +714,10 @@ k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int 
           mma16832(acc[i][2 * jj + 1], af[i], b2, b3);
         }
       }
+    }
+    if constexpr (MB) {  // warp дочитал стадию kt (фрагменты уже в регистрах и использованы mma)
+      __syncwarp();
+      if (lane == 0) mb_arrive(emptyb + 8 * st);
     }
     if (chunk_end) {  // конец чанка r: XOR тайла, rotl13, запись слова jackpot
       uint32_t xp[4];
