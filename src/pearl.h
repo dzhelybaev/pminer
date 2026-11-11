@@ -122,8 +122,13 @@ inline void fill(std::vector<int8_t> &v, uint32_t seed) {
   for (size_t i = 0; i < v.size(); i++) v[i] = gen_val(seed, (uint32_t)i);
 }
 // чанк 0 матрицы A для номера попытки nonce
-inline void chunk0(uint64_t seed, uint64_t nonce, int8_t out[1024]) {
-  for (int i = 0; i < 1024; i++) out[i] = rnd_val(seed, nonce * 1024 + i);
+// dense=false: случайны только первые CHUNK0_RAND значений, остальное нули (хорошо жмётся gzip)
+static constexpr int CHUNK0_RAND = 16;
+__host__ __device__ inline int8_t chunk0_val(uint64_t seed, uint64_t nonce, int i, bool dense) {
+  return dense || i < CHUNK0_RAND ? rnd_val(seed, nonce * 1024 + i) : 0;
+}
+inline void chunk0(uint64_t seed, uint64_t nonce, int8_t out[1024], bool dense = true) {
+  for (int i = 0; i < 1024; i++) out[i] = chunk0_val(seed, nonce, i, dense);
 }
 
 }  // namespace pearl

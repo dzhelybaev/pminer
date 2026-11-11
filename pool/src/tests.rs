@@ -157,3 +157,23 @@ fn stratum_end_to_end_with_fake_pool() {
     unsafe { pm_pool_stats(&mut acc, &mut rej, &mut st, &mut c) };
     assert_eq!((acc, rej), (1, 0));
 }
+
+/// «Разреженные» матрицы (режим майнинга по умолчанию): всё нули, кроме 16 значений чанка 0.
+/// Удачи/промахи — из эталона ref/pearlhash_ref.py; доказательство обязано жаться gzip.
+#[test]
+fn sparse_proof_compresses() {
+    let mut a = vec![0i8; M * K];
+    for (i, v) in a.iter_mut().take(16).enumerate() {
+        *v = ((splitmix(SEED_N + i as u64) % 129) as i32 - 64) as i8;
+    }
+    let bt = vec![0i8; N * K];
+    for (r0, c0, hit) in [(0, 0, true), (0, 4, true), (0, 2, false), (0, 64, false)] {
+        let (rows, cols) = tile(r0, c0);
+        let (h, pp) = proof::build(&header(), &a, M, &bt, N, K, 128, &rows, &cols).unwrap();
+        assert_eq!(proof::verify(&h, &pp, 3, None).is_ok(), hit, "тайл ({r0},{c0})");
+        let raw = proof::encode(&pp, false).unwrap().len();
+        let gz = proof::encode(&pp, true).unwrap().len();
+        assert!(gz * 20 < raw, "gzip {gz} против {raw}");
+        println!("размер: без gzip {raw} Б, gzip {gz} Б");
+    }
+}

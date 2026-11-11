@@ -86,8 +86,9 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
 // A' = A + шум одной строкой на блок, всё в одном ядре:
 // - строка E_AL (r значений) считается здесь же (r/32 хэшей blake3);
 // - A не хранится: чанк 0 (idx < 1024) = rnd_val(seedN, nonce*1024+idx), остальное gen_val(seedA, idx).
+// dense=false — «разреженные» A: нули, кроме CHUNK0_RAND значений чанка 0 (доказательство жмётся gzip)
 __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint64_t nonce, Seed key,
-                              const uint8_t *first, const uint8_t *second, int k, int r) {
+                              const uint8_t *first, const uint8_t *second, int k, int r, bool dense) {
   extern __shared__ int8_t e_row[];
   const size_t row = blockIdx.x;
   for (int hb = threadIdx.x; hb < r / 32; hb += blockDim.x) {
@@ -108,10 +109,10 @@ __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint6
     int8_t a[4];
     if (idx < 1024) {
 #pragma unroll
-      for (int e = 0; e < 4; e++) a[e] = pearl::rnd_val(seedN, nonce * 1024 + idx + e);
+      for (int e = 0; e < 4; e++) a[e] = pearl::chunk0_val(seedN, nonce, idx + e, dense);
     } else {
 #pragma unroll
-      for (int e = 0; e < 4; e++) a[e] = pearl::gen_val(seedA, idx + e);
+      for (int e = 0; e < 4; e++) a[e] = dense ? pearl::gen_val(seedA, idx + e) : 0;
     }
     uchar4 f = f4[q], g = g4[q];
     char4 o;

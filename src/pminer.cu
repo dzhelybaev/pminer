@@ -73,6 +73,7 @@ struct Miner {
   b3::Pow2Tree treeA;
   std::vector<int8_t> hA, hB;  // базовые A (m×k) и B^T (n×k) на хосте — для доказательств
   bool salted = true;          // сиды V3 (cert_version ≥ 3)
+  bool dense = false;          // false: A и B почти нулевые — доказательство сжимается gzip в ~20+ раз
   uint8_t jk[32], bseed[32];
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
@@ -136,8 +137,10 @@ struct Miner {
     if (fresh) {
       hA.assign((size_t)m * k, 0);
       hB.assign((size_t)n * k, 0);
-      pearl::fill(hA, (uint32_t)seedA);
-      pearl::fill(hB, (uint32_t)seedB);
+      if (dense) {  // иначе нули (assign выше)
+        pearl::fill(hA, (uint32_t)seedA);
+        pearl::fill(hB, (uint32_t)seedB);
+      }
     }
     treeA.build((const uint8_t *)hA.data(), hA.size(), jk);
     uint8_t hb[32];  // n — любое кратное 128, поэтому общий хэш, а не дерево степени двойки
@@ -156,7 +159,7 @@ struct Miner {
   // шум A на полосе: перестановка (+ сброс счётчика) и слитое ядро A'
   void noise_a(Lane &l, const kern::Seed &s, uint64_t nonce, unsigned *reset) {
     kern::k_perm<<<((k + 7) / 8 + 127) / 128, 128, 0, l.st>>>(l.dF, l.dS, k, r, s, true, reset);
-    kern::k_apply_fused<<<m, 256, r, l.st>>>(l.dAp, (uint32_t)seedA, seedN, nonce, s, l.dF, l.dS, k, r);
+    kern::k_apply_fused<<<m, 256, r, l.st>>>(l.dAp, (uint32_t)seedA, seedN, nonce, s, l.dF, l.dS, k, r, dense);
   }
   void gemm(Lane &l, const kern::Seed &s, unsigned *cnt, kern::Hit *hits, int maxh, uint32_t *dig) {
     int blocks = (m / bm) * (n / kern::BN);
@@ -188,7 +191,7 @@ struct Miner {
   // постановка попытки в поток полосы (без синхронизации); slot — место в пакете
   bool enqueue(uint64_t nonce, int slot, bool with_digest) {
     int8_t c0[1024];
-    pearl::chunk0(seedN, nonce, c0);  // на GPU тот же чанк считается в k_apply_fused
+    pearl::chunk0(seedN, nonce, c0, dense);  // на GPU тот же чанк считается в k_apply_fused
     uint8_t ha[32], aseed[32];
     treeA.root_with_chunk0((const uint8_t *)c0, ha);
     pearl::seed_a(bseed, ha, m, aseed, salted);
@@ -231,7 +234,7 @@ struct Miner {
   // шар в пул: полная A с чанком 0 этой попытки, строки/столбцы тайла
   void submit(const PmJob &job, uint64_t nonce, uint32_t row0, uint32_t col0) {
     std::vector<int8_t> A(hA);
-    pearl::chunk0(seedN, nonce, A.data());
+    pearl::chunk0(seedN, nonce, A.data(), dense);
     uint32_t rows[pearl::TILE_H], cols[pearl::TILE_W];
     for (int i = 0; i < pearl::TILE_H; i++) rows[i] = row0 + 8 * i;
     for (int j = 0; j < pearl::TILE_W / 2; j++) { cols[2 * j] = col0 + 8 * j; cols[2 * j + 1] = col0 + 8 * j + 1; }
@@ -253,6 +256,7 @@ static pearl::Header test_header(uint32_t nbits, uint64_t salt) {
 static bool selftest(Gpu *g, int bm) {
   Miner mn;
   mn.g = g;
+  mn.dense = true;  // самотест — на случайных матрицах эталона
   bool ok = mn.alloc(256, 128, 1, bm) && mn.job(test_header(0x1e100000, 0));
   unsigned hits = 0;
   uint32_t dig[8] = {0};
@@ -286,7 +290,7 @@ static bool selftest(Gpu *g, int bm) {
 
 struct Opts { int m = 0, n = 0, lanes = 0, bm = 0;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
-  bool pool = false; };
+  bool pool = false, dense = false; };
 
 static void worker(Gpu *g, Opts o, int ngpu) {
   if (!ck(cudaSetDevice(g->id), g, "cudaSetDevice")) return;
@@ -316,6 +320,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
+  mn.dense = o.dense;
   mn.seedA = SEED_A + 0x1000000ull * g->id;
   mn.seedB = SEED_B + 0x1000000ull * g->id;
   const pearl::Header hdr = test_header(o.nbits, 0x1234 + g->id);
@@ -423,6 +428,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
+    else if (!strcmp(argv[i], "--dense")) o.dense = true;
     else if (!strcmp(argv[i], "--pool") && i + 1 < argc) pool_url = argv[++i];
     else if (!strcmp(argv[i], "--wallet") && i + 1 < argc) wallet = argv[++i];
     else if (!strcmp(argv[i], "--pass") && i + 1 < argc) pass = argv[++i];
