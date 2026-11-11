@@ -138,13 +138,6 @@ static constexpr int STAGES = 3;  // cp.async
 inline int gemm_smem(int bm, int major) { return (major >= 8 ? 3 : 2) * (bm + BN) * BK; }
 inline int gemm_threads_rt(int bm, int wn) { return 32 * (bm / 64) * (BN / wn); }
 struct Hit { uint32_t row0, col0; };
-// описание попытки для запуска GEMM сразу по нескольким попыткам (блоки идут попытка за попыткой)
-struct AttDesc {
-  const int8_t *A;  // A' этой попытки (m×k)
-  Seed seed;        // a_seed — ключ blake3 jackpot
-  unsigned *cnt;    // счётчик удач
-  Hit *hits;        // координаты удач
-};
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
   return (uint32_t)__cvta_generic_to_shared(p);
@@ -245,17 +238,15 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, int8_t *s
 // 32 (тайл 8×8, 64 аккумулятора, вдвое больше warp на SM). Кусок warp — 64×WN.
 template <int BM, int WN = 64, int MODE = 0>
 __global__ void __launch_bounds__(32 * (BM / 64) * (BN / WN), BM == 128 ? 2 : 1)
-k_gemm(const AttDesc *__restrict__ atts, const int8_t *__restrict__ Bt, int m, int n, int k, int r, Bound bnd,
-       int max_hits, uint32_t *digest) {
+k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
+       Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
   constexpr int WARPS_N = BN / WN, NTHR = 32 * (BM / 64) * WARPS_N, GROUP_M = 1024 / BM, NJ = WN / 8;
   extern __shared__ __align__(128) int8_t smem[];  // STAGES × (A BM×BK | B BN×BK)
   int8_t(*sA)[BM * BK] = (int8_t(*)[BM * BK])smem;
   int8_t(*sB)[BN * BK] = (int8_t(*)[BN * BK])(smem + STAGES * BM * BK);
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
   const int wm = (warp / WARPS_N) * 64, wn = (warp % WARPS_N) * WN;
-  const int nbm = m / BM, nbn = n / BN, gsz = GROUP_M * nbn;
-  const int ai = blockIdx.x / (nbm * nbn), pid = blockIdx.x - ai * nbm * nbn;  // попытка и блок в ней
-  const int8_t *__restrict__ A = atts[ai].A;
+  const int nbm = m / BM, nbn = n / BN, gsz = GROUP_M * nbn, pid = blockIdx.x;
   const int first = (pid / gsz) * GROUP_M, gs = min(nbm - first, GROUP_M), loc = pid % gsz;
   const int bm = first + loc % gs, bn = loc / gs;
   const int8_t *gA = A + (size_t)bm * BM * k;
@@ -361,7 +352,6 @@ k_gemm(const AttDesc *__restrict__ atts, const int8_t *__restrict__ Bt, int m, i
     for (int q = 0; q < 16; q++) if (q == idx) msg[q] = jp[i];
   }
   uint32_t h[8];
-  const Seed a_seed = atts[ai].seed;
   b3::compress(a_seed.w, msg, 0, 64, SINGLE_KEYED, h);
   bool le = true;  // h (LE 256 бит) <= bnd
 #pragma unroll
@@ -373,8 +363,7 @@ k_gemm(const AttDesc *__restrict__ atts, const int8_t *__restrict__ Bt, int m, i
     for (int w = 0; w < 8; w++) atomicXor(&digest[w], h[w]);
   }
   if (le) {
-    unsigned i = atomicAdd(atts[ai].cnt, 1u);
-    Hit *hits = atts[ai].hits;
+    unsigned i = atomicAdd(hit_count, 1u);
     if ((int)i < max_hits) {
       hits[i].row0 = bm * BM + wm + (lane >> 2);
       hits[i].col0 = bn * BN + wn + 2 * (lane & 3);
