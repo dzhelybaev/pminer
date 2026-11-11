@@ -23,6 +23,9 @@ int main() {
   h.timestamp = 0x6a000000; h.nbits = 0x1e100000;
   uint8_t hb[76]; pearl::header_bytes(h, hb); hex("header", hb, 76);
   uint8_t cb[52]; pearl::config_bytes(cb); hex("config", cb, 52);
+  pearl::config_bytes(cb, 8); hex("config8", cb, 52);
+  { uint32_t b[8]; pearl::bound(0x1e100000, b, 8); uint8_t bb[32]; b3::store_words(b, bb, 8); hex("bound8", bb, 32);
+    uint8_t t[32] = {0}; t[27] = 2; pearl::bound_from_target(t, b, 8); b3::store_words(b, bb, 8); hex("bt8", bb, 32); }
   uint8_t jk[32], bs[32], as[32]; pearl::job_key(h, jk); hex("job_key", jk, 32);
   pearl::seed_b(jk, key, 128, bs); hex("seed_b", bs, 32);
   pearl::seed_a(bs, d.data(), 128, as); hex("seed_a", as, 32);

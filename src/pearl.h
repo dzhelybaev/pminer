@@ -13,6 +13,8 @@ namespace pearl {
 static constexpr int K = 4096, R = 128, TILE_H = 8, TILE_W = 16;
 static const uint8_t ROWS_PATTERN[6] = {7, 7, 0, 0, 0, 0};
 static const uint8_t COLS_PATTERN[6] = {0, 1, 3, 7, 0, 0};
+// тайл 8×8 (кусок warp 64×32): cols [0,1,8,9,16,17,24,25]
+static const uint8_t COLS_PATTERN8[6] = {0, 1, 3, 3, 0, 0};
 
 struct Header {
   uint32_t version = 1;
@@ -30,24 +32,25 @@ inline void header_bytes(const Header &h, uint8_t out[76]) {
   put32(out + 72, h.nbits);
 }
 
-inline void config_bytes(uint8_t out[52]) {
+// tw — ширина тайла jackpot: 16 (основной) или 8
+inline void config_bytes(uint8_t out[52], int tw = TILE_W) {
   memset(out, 0, 52);
   put32(out, K);
   out[4] = R & 0xff; out[5] = R >> 8;  // rank u16, mma_type u16 = 0
   memcpy(out + 8, ROWS_PATTERN, 6);
-  memcpy(out + 14, COLS_PATTERN, 6);
+  memcpy(out + 14, tw == 8 ? COLS_PATTERN8 : COLS_PATTERN, 6);
 }
 
-inline void job_key_raw(const uint8_t hdr[76], uint8_t out[32]) {
+inline void job_key_raw(const uint8_t hdr[76], uint8_t out[32], int tw = TILE_W) {
   uint8_t buf[128];
   memcpy(buf, hdr, 76);
-  config_bytes(buf + 76);
+  config_bytes(buf + 76, tw);
   b3::hash_small(buf, 128, nullptr, out);
 }
-inline void job_key(const Header &h, uint8_t out[32]) {
+inline void job_key(const Header &h, uint8_t out[32], int tw = TILE_W) {
   uint8_t hb[76];
   header_bytes(h, hb);
-  job_key_raw(hb, out);
+  job_key_raw(hb, out, tw);
 }
 
 // V3: hash' = blake3_keyed(SALT, hash | dim_le32 | 0*28)
@@ -74,9 +77,9 @@ inline void seed_a(const uint8_t bseed[32], const uint8_t hash_a[32], uint32_t m
 }
 
 // граница из цели пула: target · TILE_H·TILE_W·K (= 2^19), насыщение до 2^256-1; LE слова
-inline void bound_from_target(const uint8_t target_le[32], uint32_t out[8]) {
+inline void bound_from_target(const uint8_t target_le[32], uint32_t out[8], int tw = TILE_W) {
   static_assert(TILE_H * TILE_W * K == (1 << 19), "множитель границы — 2^19");
-  const int sh = 19;
+  const int sh = tw == 8 ? 18 : 19;  // log2(TILE_H·tw·K)
   uint32_t t[8];
   b3::load_words(target_le, t, 8);
   if (t[7] >> (32 - sh)) {  // старшие биты уходят за 256 → максимум
@@ -87,11 +90,11 @@ inline void bound_from_target(const uint8_t target_le[32], uint32_t out[8]) {
 }
 
 // граница: target(nbits) * TILE_H*TILE_W*K, насыщение до 2^256-1; 8 слов LE
-inline void bound(uint32_t nbits, uint32_t out[8]) {
+inline void bound(uint32_t nbits, uint32_t out[8], int tw = TILE_W) {
   uint32_t e = nbits >> 24, mant = nbits & 0xffffff;
   memset(out, 0, 32);
   if (!mant || !e || (mant & 0x800000)) return;
-  uint64_t factor = (uint64_t)TILE_H * TILE_W * K;
+  uint64_t factor = (uint64_t)TILE_H * tw * K;
   // t = mant * 2^(8(e-3)); итог = mant*factor * 2^(8(e-3))
   int sh = 8 * ((int)e - 3);
   if (sh < 0) { mant >>= -sh; sh = 0; }  // как в Rust: сначала target, потом умножение

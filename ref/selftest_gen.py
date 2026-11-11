@@ -45,11 +45,12 @@ def matrices(nonce=0):
     return a.reshape(M, K), bt.reshape(N, K)
 
 
-def main():
+def run(tw):
+    """tw — ширина тайла: 16 (cols [0,1,8,9,..,56,57]) или 8 (cols [0,1,8,9,..,24,25])."""
     with np.errstate(over="ignore"):
         a, bt = matrices()
     rows = R.Pattern(list(range(0, 64, 8)))
-    cols = R.Pattern([j + b for j in range(0, 64, 8) for b in (0, 1)])
+    cols = R.Pattern([j + b for j in range(0, 8 * tw // 2, 8) for b in (0, 1)])
     hdr = R.header_bytes(1, bytes(range(32)), bytes(0x80 + i for i in range(32)), 0x6A000000, NBITS)
     dig = np.zeros(8, np.uint32)
     hits = []
@@ -57,10 +58,15 @@ def main():
         dig ^= np.frombuffer(h, "<u4")
         if hit:
             hits.append((r0, c0))
-    print("// сгенерировано ref/selftest_gen.py")
-    print(f"static const unsigned SELFTEST_HITS = {len(hits)};")
-    print("static const uint32_t SELFTEST_DIGEST[8] = {" + ", ".join(f"0x{int(x):08x}u" for x in dig) + "};")
-    print(f"// первые удачи (row0,col0): {sorted(hits)[:6]}")
+    return hits, dig
+
+
+def main():
+    print("// сгенерировано ref/selftest_gen.py; индекс [0] — тайл 8×16, [1] — тайл 8×8")
+    res = [run(16), run(8)]
+    print("static const unsigned SELFTEST_HITS[2] = {" + ", ".join(str(len(h)) for h, _ in res) + "};")
+    print("static const uint32_t SELFTEST_DIGEST[2][8] = {" + ", ".join(
+        "{" + ", ".join(f"0x{int(x):08x}u" for x in d) + "}" for _, d in res) + "};")
 
 
 if __name__ == "__main__":

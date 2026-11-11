@@ -136,6 +136,7 @@ static constexpr int STAGES = 3;  // cp.async
 #endif
 // размер dynamic smem на хосте (STAGES зависит от архитектуры)
 inline int gemm_smem(int bm, int major) { return (major >= 8 ? 3 : 2) * (bm + BN) * BK; }
+inline int gemm_threads_rt(int bm, int wn) { return 32 * (bm / 64) * (BN / wn); }
 struct Hit { uint32_t row0, col0; };
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
@@ -233,27 +234,29 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, int8_t *s
 // MODE — диагностика узких мест (0 = рабочий режим):
 // 1 — без загрузок global→smem в цикле; 2 — ещё и без барьеров; 3 — ещё и без ldmatrix
 // (фрагменты загружены один раз). Результат в режимах 1–3 бессмысленный, важна только скорость.
-template <int BM, int MODE = 0>
-__global__ void __launch_bounds__(BM, BM == 128 ? 2 : 1)
+// WN — ширина куска warp: 64 (тайл jackpot 8×16, 128 аккумуляторов на поток) или
+// 32 (тайл 8×8, 64 аккумулятора, вдвое больше warp на SM). Кусок warp — 64×WN.
+template <int BM, int WN = 64, int MODE = 0>
+__global__ void __launch_bounds__(32 * (BM / 64) * (BN / WN), BM == 128 ? 2 : 1)
 k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
-  constexpr int NTHR = BM, GROUP_M = 1024 / BM;
+  constexpr int WARPS_N = BN / WN, NTHR = 32 * (BM / 64) * WARPS_N, GROUP_M = 1024 / BM, NJ = WN / 8;
   extern __shared__ __align__(128) int8_t smem[];  // STAGES × (A BM×BK | B BN×BK)
   int8_t(*sA)[BM * BK] = (int8_t(*)[BM * BK])smem;
   int8_t(*sB)[BN * BK] = (int8_t(*)[BN * BK])(smem + STAGES * BM * BK);
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
-  const int wm = (warp >> 1) * 64, wn = (warp & 1) * 64;
+  const int wm = (warp / WARPS_N) * 64, wn = (warp % WARPS_N) * WN;
   const int nbm = m / BM, nbn = n / BN, gsz = GROUP_M * nbn, pid = blockIdx.x;
   const int first = (pid / gsz) * GROUP_M, gs = min(nbm - first, GROUP_M), loc = pid % gsz;
   const int bm = first + loc % gs, bn = loc / gs;
   const int8_t *gA = A + (size_t)bm * BM * k;
   const int8_t *gB = Bt + (size_t)bn * BN * k;
 
-  int acc[4][8][4];
+  int acc[4][NJ][4];
 #pragma unroll
   for (int i = 0; i < 4; i++)
 #pragma unroll
-    for (int j = 0; j < 8; j++)
+    for (int j = 0; j < NJ; j++)
 #pragma unroll
       for (int c = 0; c < 4; c++) acc[i][j][c] = 0;
   uint32_t jp[16];
@@ -272,7 +275,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_seg = lane >> 4;
   const int b_row = (lane & 7) + 8 * (lane >> 4), b_seg = (lane >> 3) & 1;
 
-  uint32_t af[2][4][4], bf[2][8][2];  // фрагменты двух шагов k32
+  uint32_t af[2][4][4], bf[2][NJ][2];  // фрагменты двух шагов k32
   auto load_frags = [&](int st) {
 #pragma unroll
       for (int ks = 0; ks < 2; ks++) {
@@ -281,7 +284,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
           ldsm4(af[ks][i][0], af[ks][i][1], af[ks][i][2], af[ks][i][3],
                 &sA[st][sw(wm + 16 * i + a_row, 2 * ks + a_seg)]);
 #pragma unroll
-        for (int j = 0; j < 4; j++)
+        for (int j = 0; j < NJ / 2; j++)
           ldsm4(bf[ks][2 * j][0], bf[ks][2 * j][1], bf[ks][2 * j + 1][0], bf[ks][2 * j + 1][1],
                 &sB[st][sw(wn + 16 * j + b_row, 2 * ks + b_seg)]);
       }
@@ -312,7 +315,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 #pragma unroll
         for (int i = 0; i < 4; i++)
 #pragma unroll
-          for (int j = 0; j < 8; j++) mma16832(acc[i][j], af[ks][i], bf[ks][j][0], bf[ks][j][1]);
+          for (int j = 0; j < NJ; j++) mma16832(acc[i][j], af[ks][i], bf[ks][j][0], bf[ks][j][1]);
     }
     if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
       uint32_t xp[4];  // XOR деревом: 4 независимые цепочки вместо одной длинной
@@ -322,7 +325,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 #pragma unroll
         for (int i = 0; i < 4; i++)
 #pragma unroll
-          for (int j = 0; j < 8; j++) xp[c] ^= (uint32_t)acc[i][j][c];
+          for (int j = 0; j < NJ; j++) xp[c] ^= (uint32_t)acc[i][j][c];
       }
       uint32_t x = (xp[0] ^ xp[1]) ^ (xp[2] ^ xp[3]);
       uint32_t nv = ((jp[0] << 13) | (jp[0] >> 19)) ^ x;
