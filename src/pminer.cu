@@ -61,6 +61,7 @@ struct Lane {
 struct Miner {
   Gpu *g = nullptr;
   int m = 0, n = 0, smem = 0, bm = 128, wn = 64, tw = 16, lanes = LANES;  // tw — ширина тайла = wn/4
+  bool pipe = true;  // v0.15: конвейер фрагментов через границу стадий (только блок 128, тайл 8×16)
   const int k = pearl::K, r = pearl::R;
   static const int LANES = 2, MAX_HITS = 64, BATCH = 64;  // BATCH — максимум слотов пакета
   Lane ln[LANES];
@@ -78,14 +79,16 @@ struct Miner {
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
-  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64) {
-    m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4;
+  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true) {
+    m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4; pipe = pipe_ && bm == 128 && wn == 64;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
     smem = kern::gemm_smem(bm, p.major);
-    if (bm == 256) CK(cudaFuncSetAttribute(kern::k_gemm<256, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    else if (wn == 32) CK(cudaFuncSetAttribute(kern::k_gemm<128, 32>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-    else CK(cudaFuncSetAttribute(kern::k_gemm<128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    const auto attr = cudaFuncAttributeMaxDynamicSharedMemorySize;
+    if (bm == 256) CK(cudaFuncSetAttribute(kern::k_gemm<256, 64, 0, false>, attr, smem));
+    else if (wn == 32) CK(cudaFuncSetAttribute(kern::k_gemm<128, 32, 0, false>, attr, smem));
+    else if (pipe) CK(cudaFuncSetAttribute(kern::k_gemm<128, 64, 0, true>, attr, smem));
+    else CK(cudaFuncSetAttribute(kern::k_gemm<128, 64, 0, false>, attr, smem));
     for (int i = 0; i < lanes; i++) {
       CK(cudaStreamCreateWithFlags(&ln[i].st, cudaStreamNonBlocking));
       CK(cudaMalloc(&ln[i].dAp, (size_t)m * k));
@@ -165,26 +168,26 @@ struct Miner {
   void gemm(Lane &l, const kern::Seed &s, unsigned *cnt, kern::Hit *hits, int maxh, uint32_t *dig) {
     int blocks = (m / bm) * (n / kern::BN);
     int thr = kern::gemm_threads_rt(bm, wn);
-    if (bm == 256)
-      kern::k_gemm<256, 64><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
-    else if (wn == 32)
-      kern::k_gemm<128, 32><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
-    else
-      kern::k_gemm<128, 64><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+#define PM_GEMM(...) kern::k_gemm<__VA_ARGS__><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig)
+    if (bm == 256) PM_GEMM(256, 64, 0, false);
+    else if (wn == 32) PM_GEMM(128, 32, 0, false);
+    else if (pipe) PM_GEMM(128, 64, 0, true);
+    else PM_GEMM(128, 64, 0, false);
+#undef PM_GEMM
   }
 
   // диагностика: время одного GEMM (мс) в режиме MODE на полосе 0, только блок 128
-  template <int WN, int MODE> float diag_gemm(const kern::Seed &s, int reps) {
-    cudaFuncSetAttribute(kern::k_gemm<128, WN, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+  template <int WN, int MODE, bool PIPE> float diag_gemm(const kern::Seed &s, int reps) {
+    cudaFuncSetAttribute(kern::k_gemm<128, WN, MODE, PIPE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
     const int thr = kern::gemm_threads_rt(128, WN);
     Lane &l = ln[0];
     int blocks = (m / 128) * (n / kern::BN);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
-    kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+    kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
     cudaEventRecord(e0, l.st);
     for (int i = 0; i < reps; i++)
-      kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+      kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
     cudaEventRecord(e1, l.st);
     cudaEventSynchronize(e1);
     float ms = 0;
@@ -262,11 +265,11 @@ static pearl::Header test_header(uint32_t nbits, uint64_t salt) {
   return h;
 }
 
-static bool selftest(Gpu *g, int bm, int wn) {
+static bool selftest(Gpu *g, int bm, int wn, bool pipe = false) {
   Miner mn;
   mn.g = g;
   mn.dense = true;  // самотест — на случайных матрицах эталона
-  bool ok = mn.alloc(256, 128, 1, bm, wn) && mn.job(test_header(0x1e100000, 0));
+  bool ok = mn.alloc(256, 128, 1, bm, wn, pipe) && mn.job(test_header(0x1e100000, 0));
   const int vi = wn == 32 ? 1 : 0;  // набор ожидаемых значений
   unsigned hits = 0;
   uint32_t dig[8] = {0};
@@ -292,43 +295,37 @@ static bool selftest(Gpu *g, int bm, int wn) {
   mn.release();
   if (!ok) return false;
   bool pass = hits == SELFTEST_HITS[vi] && !memcmp(dig, SELFTEST_DIGEST[vi], 32) && proof_ok == 1;
-  LOG("GPU%d selftest блок %d тайл 8×%d: %s (hits %u/%u, digest %08x.. ожид. %08x.., доказательство %s)\n", g->id,
-      bm, wn / 4, pass ? "OK" : "FAIL", hits, SELFTEST_HITS[vi], dig[0], SELFTEST_DIGEST[vi][0],
+  LOG("GPU%d selftest блок %d тайл 8×%d%s: %s (hits %u/%u, digest %08x.. ожид. %08x.., доказательство %s)\n", g->id,
+      bm, wn / 4, mn.pipe ? " конвейер" : "", pass ? "OK" : "FAIL", hits, SELFTEST_HITS[vi], dig[0], SELFTEST_DIGEST[vi][0],
       proof_ok == 1 ? "OK" : "FAIL");
   return pass;
 }
 
-struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0;  // 0 — автонастройка
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
 
 static void worker(Gpu *g, Opts o, int ngpu) {
   if (!ck(cudaSetDevice(g->id), g, "cudaSetDevice")) return;
-  if (!selftest(g, 128, 64) || !selftest(g, 128, 32) || !selftest(g, 256, 64)) { g->state = -1; return; }
+  if (!selftest(g, 128, 64, true) || !selftest(g, 128, 64, false) || !selftest(g, 128, 32) || !selftest(g, 256, 64)) {
+    g->state = -1;
+    return;
+  }
   if (o.selftest_only) { g->state = 2; return; }
   cudaDeviceProp p;
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
-  struct Cand { int bm, m, n, lanes, wn; };
+  struct Cand { int bm, m, n, lanes, wn; bool pipe; };
   std::vector<Cand> cands;
-  // n, при котором число блоков (m/128)·(n/128) кратно числу мест (2 блока на SM) —
-  // последняя волна блоков заполнена целиком; ближайшее к target
-  const int slots = 2 * p.multiProcessorCount;
-  auto aligned_n = [&](int m, int target) {
-    int rows = m / 128, g0 = rows, b = slots;
-    while (b) { int t2 = g0 % b; g0 = b; b = t2; }
-    int c0 = slots / g0, q = (target / 128 + c0 / 2) / c0;
-    return 128 * c0 * (q < 1 ? 1 : q);
-  };
-  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64});
+  // («n под волну» из v0.9 ни разу не выиграл — убран из перебора)
+  // {блок, m, n, полосы, ширина warp, конвейер}. Тайл 8×8 (v0.13) везде проигрывал — только --tile 8
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0});
   else if (big_l2)
-    cands = {{128, 512, 4096, 2, 64}, {128, 1024, 4096, 2, 64}, {128, 2048, 2048, 1, 64},
-             {128, 512, 4096, 2, 32}, {128, 1024, 4096, 2, 32}, {128, 2048, 2048, 1, 32},
-             {128, 1024, aligned_n(1024, 2048), 2, 32}};
+    cands = {{128, 512, 4096, 2, 64, true}, {128, 1024, 4096, 2, 64, true}, {128, 2048, 2048, 1, 64, true},
+             {128, 512, 4096, 2, 64, false}, {128, 1024, 4096, 2, 64, false}};
   else
-    cands = {{128, 8192, 16384, 2, 64}, {128, 4096, 8192, 2, 64}, {128, 8192, 16384, 2, 32},
-             {128, 4096, 8192, 2, 32}};
+    cands = {{128, 8192, 16384, 2, 64, true}, {128, 8192, 16384, 2, 64, false}, {128, 4096, 8192, 2, 64, true}};
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
@@ -342,7 +339,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   double best_hs = -1;
   int best_bs = 8;
   for (const Cand &c : cands) {
-    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
     int bs = 8;
     auto tw = std::chrono::steady_clock::now();
@@ -361,15 +358,18 @@ static void worker(Gpu *g, Opts o, int ngpu) {
       sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
-    LOG("GPU%d тест: блок %d тайл 8×%d m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4, c.m, c.n,
-        c.lanes, bs, hs / 1e12);
+    LOG("GPU%d тест: блок %d тайл 8×%d%s m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
+        mn.pipe ? " конвейер" : "", c.m, c.n, c.lanes, bs, hs / 1e12);
     if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
-  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn) || !mn.job(hdr)) { g->state = -1; return; }
-  LOG("GPU%d выбрано: блок %d тайл 8×%d m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4, best.m,
-      best.n, best.lanes,
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe) || !mn.job(hdr)) {
+    g->state = -1;
+    return;
+  }
+  LOG("GPU%d выбрано: блок %d тайл 8×%d%s m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
+      mn.pipe ? " конвейер" : "", best.m, best.n, best.lanes,
       best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
   if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
@@ -380,11 +380,14 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     double mac1 = (double)o.m * o.n * pearl::K;
     float t[4];
     if (best.wn == 32) {
-      t[0] = mn.diag_gemm<32, 0>(s, reps); t[1] = mn.diag_gemm<32, 1>(s, reps);
-      t[2] = mn.diag_gemm<32, 2>(s, reps); t[3] = mn.diag_gemm<32, 3>(s, reps);
+      t[0] = mn.diag_gemm<32, 0, false>(s, reps); t[1] = mn.diag_gemm<32, 1, false>(s, reps);
+      t[2] = mn.diag_gemm<32, 2, false>(s, reps); t[3] = mn.diag_gemm<32, 3, false>(s, reps);
+    } else if (mn.pipe) {
+      t[0] = mn.diag_gemm<64, 0, true>(s, reps); t[1] = mn.diag_gemm<64, 1, true>(s, reps);
+      t[2] = mn.diag_gemm<64, 2, true>(s, reps); t[3] = mn.diag_gemm<64, 3, true>(s, reps);
     } else {
-      t[0] = mn.diag_gemm<64, 0>(s, reps); t[1] = mn.diag_gemm<64, 1>(s, reps);
-      t[2] = mn.diag_gemm<64, 2>(s, reps); t[3] = mn.diag_gemm<64, 3>(s, reps);
+      t[0] = mn.diag_gemm<64, 0, false>(s, reps); t[1] = mn.diag_gemm<64, 1, false>(s, reps);
+      t[2] = mn.diag_gemm<64, 2, false>(s, reps); t[3] = mn.diag_gemm<64, 3, false>(s, reps);
     }
     LOG("GPU%d диагностика GEMM, TH/s: полный %.1f | без загрузок %.1f | +без барьеров %.1f | +без ldmatrix %.1f\n",
         g->id, mac1 / t[0] / 1e9, mac1 / t[1] / 1e9, mac1 / t[2] / 1e9, mac1 / t[3] / 1e9);
@@ -447,6 +450,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--n") && i + 1 < argc) o.n = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nbits") && i + 1 < argc) o.nbits = strtoul(argv[++i], nullptr, 16);
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--nopipe")) o.pipe = 0;
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tile") && i + 1 < argc) o.wn = atoi(argv[++i]) * 4;  // 16 или 8
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;

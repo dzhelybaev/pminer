@@ -236,7 +236,8 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, int8_t *s
 // (фрагменты загружены один раз). Результат в режимах 1–3 бессмысленный, важна только скорость.
 // WN — ширина куска warp: 64 (тайл jackpot 8×16, 128 аккумуляторов на поток) или
 // 32 (тайл 8×8, 64 аккумулятора, вдвое больше warp на SM). Кусок warp — 64×WN.
-template <int BM, int WN = 64, int MODE = 0>
+// PIPE — конвейер фрагментов через границу стадий (v0.15); false — прежний цикл (v0.7–v0.13)
+template <int BM, int WN = 64, int MODE = 0, bool PIPE = true>
 __global__ void __launch_bounds__(32 * (BM / 64) * (BN / WN), BM == 128 ? 2 : 1)
 k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
@@ -275,6 +276,80 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_seg = lane >> 4;
   const int b_row = (lane & 7) + 8 * (lane >> 4), b_seg = (lane >> 3) & 1;
 
+  if constexpr (PIPE) {
+  // Конвейер по шагам k32 (2 шага на стадию BK=64), фрагменты в двух буферах:
+  //   шаг 0 стадии: ldmatrix шага 1 → загрузка будущей стадии → mma шага 0;
+  //   шаг 1 стадии: ожидание + барьер → ldmatrix шага 0 СЛЕДУЮЩЕЙ стадии → mma шага 1.
+  // Так барьер и задержка ldmatrix перекрываются уже выданными mma, а не стоят перед ними.
+  uint32_t af[2][4][4], bf[2][NJ][2];
+  auto ldfr = [&](int b, int st, int ks) {
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+      ldsm4(af[b][i][0], af[b][i][1], af[b][i][2], af[b][i][3], &sA[st][sw(wm + 16 * i + a_row, 2 * ks + a_seg)]);
+#pragma unroll
+    for (int j = 0; j < NJ / 2; j++)
+      ldsm4(bf[b][2 * j][0], bf[b][2 * j][1], bf[b][2 * j + 1][0], bf[b][2 * j + 1][1],
+            &sB[st][sw(wn + 16 * j + b_row, 2 * ks + b_seg)]);
+  };
+  auto mmas = [&](int b) {
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+      for (int j = 0; j < NJ; j++) mma16832(acc[i][j], af[b][i], bf[b][j][0], bf[b][j][1]);
+  };
+
+  cp_wait<STAGES - 2>();
+  __syncthreads();  // стадия 0 готова
+  ldfr(0, 0, 0);
+  if constexpr (MODE >= 3) ldfr(1, 0, 1);
+
+  int st = 0;
+  for (int kt = 0; kt < KT; kt++) {
+    const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;  // ns — буфер стадии kt-1
+    const int st1 = st == STAGES - 1 ? 0 : st + 1;
+    if constexpr (MODE < 3) ldfr(1, st, 1);
+#if __CUDA_ARCH__ >= 800
+    if constexpr (MODE < 1)
+      if (nk < KT) { load_tile<BM, NTHR>(sA[ns], gA + nk * BK, k, t); load_tile<BN, NTHR>(sB[ns], gB + nk * BK, k, t); }
+    cp_commit();
+    mmas(0);
+#else
+    constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
+    [[maybe_unused]] RegStage<SA, SB> rg;
+    if constexpr (MODE < 1)
+      if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
+    mmas(0);
+    if constexpr (MODE < 1)
+      if (nk < KT) store_regs<NTHR>(rg, sA[ns], sB[ns], t);
+#endif
+    if (kt + 1 < KT) {
+      if constexpr (MODE < 2) {
+        cp_wait<STAGES - 2>();
+        __syncthreads();  // стадия kt+1 готова; стадию kt все уже прочитали в ldfr выше
+      }
+      if constexpr (MODE < 3) ldfr(0, st1, 0);
+    }
+    mmas(1);
+    if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
+      uint32_t xp[4];  // XOR деревом: 4 независимые цепочки вместо одной длинной
+#pragma unroll
+      for (int c = 0; c < 4; c++) {
+        xp[c] = 0;
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+          for (int j = 0; j < NJ; j++) xp[c] ^= (uint32_t)acc[i][j][c];
+      }
+      uint32_t x = (xp[0] ^ xp[1]) ^ (xp[2] ^ xp[3]);
+      uint32_t nv = ((jp[0] << 13) | (jp[0] >> 19)) ^ x;
+#pragma unroll
+      for (int i = 0; i < 15; i++) jp[i] = jp[i + 1];
+      jp[15] = nv;
+    }
+    st = st1;
+  }
+
+  } else {
   uint32_t af[2][4][4], bf[2][NJ][2];  // фрагменты двух шагов k32
   auto load_frags = [&](int st) {
 #pragma unroll
@@ -338,6 +413,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
       if (nk < KT) store_regs<NTHR>(rg, sA[ns], sB[ns], t);
 #endif
     st = st == STAGES - 1 ? 0 : st + 1;
+  }
+
   }
 
   // позиция i после N сдвигов хранит слово (i+N)%16
