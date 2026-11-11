@@ -301,6 +301,43 @@ static bool selftest(Gpu *g, int bm, int wn, bool pipe = false) {
   return pass;
 }
 
+// Микробенчмарк: TH/s чистых mma при 8/16/32 warp на SM, постоянные и меняющиеся данные.
+// Отвечает, во что упирается ядро: в число warp (регистры) или в энергию на операцию.
+static void microbench(Gpu *g) {
+  cudaDeviceProp p;
+  cudaGetDeviceProperties(&p, g->id);
+  int *d = nullptr;
+  if (cudaMalloc(&d, 4) != cudaSuccess) return;
+  cudaEvent_t e0, e1;
+  cudaEventCreate(&e0); cudaEventCreate(&e1);
+  char line[512];
+  int pos = snprintf(line, sizeof line, "GPU%d микробенч mma, TH/s (постоянные / меняющиеся данные):", g->id);
+  for (int bps : {2, 4, 8}) {  // блоков по 4 warp на SM → 8, 16, 32 warp на SM
+    const int blocks = p.multiProcessorCount * bps;
+    // ~50 мс на запуск при ~60 TH/s
+    const int iters = (int)(3e12 / ((double)blocks * 4 * 8 * 4096));
+    double ths[2];
+    for (int rnd = 0; rnd < 2; rnd++) {
+      auto launch = [&] {
+        if (rnd) kern::k_bench<true><<<blocks, 128>>>(iters, d, 1);
+        else kern::k_bench<false><<<blocks, 128>>>(iters, d, 1);
+      };
+      launch();
+      cudaEventRecord(e0);
+      for (int i = 0; i < 4; i++) launch();
+      cudaEventRecord(e1);
+      cudaEventSynchronize(e1);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, e0, e1);
+      ths[rnd] = (double)blocks * 4 * 8 * 4096.0 * iters * 4 / (ms * 1e-3) / 1e12;
+    }
+    pos += snprintf(line + pos, sizeof line - pos, " %d warp: %.1f / %.1f |", bps * 4, ths[0], ths[1]);
+  }
+  LOG("%s\n", line);
+  cudaEventDestroy(e0); cudaEventDestroy(e1);
+  cudaFree(d);
+}
+
 struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
@@ -312,6 +349,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     return;
   }
   if (o.selftest_only) { g->state = 2; return; }
+  microbench(g);
   cudaDeviceProp p;
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
