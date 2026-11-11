@@ -189,13 +189,15 @@ __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, uint32_t b0,
 // Микробенчмарк тензорных ядер: 4 warp в блоке, 8 независимых цепочек mma на warp, данные в
 // регистрах. RND=false — постоянные операнды (как бенчмарк v0.1), RND=true — операнды меняются
 // каждые 8 mma (по энергии ближе к настоящим данным). Число warp на SM задаётся сеткой.
-template <bool RND>
+// mma без volatile: при CH=1 цепочка зависимых mma всё равно не сворачивается (asm с "+r")
+// CH — число независимых цепочек аккумуляторов на warp (ILP)
+template <bool RND, int CH = 8>
 __global__ void __launch_bounds__(128) k_bench(int iters, int *out, uint32_t seed) {
   uint32_t a[4], b0, b1;
   a[0] = (threadIdx.x * 0x01010101u) ^ seed ^ (blockIdx.x * 0x9E3779B9u);
   a[1] = a[0] * 3; a[2] = a[0] * 5; a[3] = a[0] * 7;
   b0 = a[0] ^ 0x5a5a5a5au; b1 = b0 * 9;
-  int acc[8][4] = {};
+  int acc[CH][4] = {};
 #pragma unroll 1
   for (int i = 0; i < iters; i++) {
     if (RND) {
@@ -203,11 +205,13 @@ __global__ void __launch_bounds__(128) k_bench(int iters, int *out, uint32_t see
       b0 += 0x27D4EB2Fu; b1 += 0x165667B1u;
     }
 #pragma unroll
-    for (int c = 0; c < 8; c++) mma16832(acc[c], a, b0, b1);
+    for (int r = 0; r < 8 / CH; r++)  // всего 8 mma на итерацию при любом CH
+#pragma unroll
+      for (int c = 0; c < CH; c++) mma16832(acc[c], a, b0, b1);
   }
   int x = 0;
 #pragma unroll
-  for (int c = 0; c < 8; c++) x ^= acc[c][0] ^ acc[c][1] ^ acc[c][2] ^ acc[c][3];
+  for (int c = 0; c < CH; c++) x ^= acc[c][0] ^ acc[c][1] ^ acc[c][2] ^ acc[c][3];
   if (x == 0x7fffffff) out[0] = x;  // не даём компилятору выкинуть работу
 }
 

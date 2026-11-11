@@ -334,6 +334,28 @@ static void microbench(Gpu *g) {
     pos += snprintf(line + pos, sizeof line - pos, " %d warp: %.1f / %.1f |", bps * 4, ths[0], ths[1]);
   }
   LOG("%s\n", line);
+  {  // ILP при 8 warp на SM (как в нашем ядре), меняющиеся данные: 1, 4, 8 цепочек на warp
+    const int blocks = p.multiProcessorCount * 2;
+    const int iters = (int)(1.5e12 / ((double)blocks * 4 * 8 * 4096));
+    pos = snprintf(line, sizeof line, "GPU%d микробенч ILP при 8 warp/SM, меняющиеся данные, TH/s:", g->id);
+    for (int ch : {1, 4, 8}) {
+      auto launch = [&] {
+        if (ch == 1) kern::k_bench<true, 1><<<blocks, 128>>>(iters, d, 1);
+        else if (ch == 4) kern::k_bench<true, 4><<<blocks, 128>>>(iters, d, 1);
+        else kern::k_bench<true, 8><<<blocks, 128>>>(iters, d, 1);
+      };
+      launch();
+      cudaEventRecord(e0);
+      for (int i = 0; i < 4; i++) launch();
+      cudaEventRecord(e1);
+      cudaEventSynchronize(e1);
+      float ms = 0;
+      cudaEventElapsedTime(&ms, e0, e1);
+      double ths = (double)blocks * 4 * 8 * 4096.0 * iters * 4 / (ms * 1e-3) / 1e12;
+      pos += snprintf(line + pos, sizeof line - pos, " %d цеп.: %.1f |", ch, ths);
+    }
+    LOG("%s\n", line);
+  }
   cudaEventDestroy(e0); cudaEventDestroy(e1);
   cudaFree(d);
 }
