@@ -643,6 +643,11 @@ k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int 
       load_tile<BN, NTHR>(sB(st ^ 1) + loff, gB + oB);
     }
     cp_commit();
+    // v0.26: слово jackpot читается из локальной памяти заранее (volatile — до ldmatrix), чтобы его
+    // задержка ушла под mma; профиль v0.25: 2.5% простоев на rotl, ждавшем этой загрузки
+    const bool chunk_end = (kt + 1) % per_chunk == 0;
+    uint32_t jv = 0;
+    if (chunk_end) jv = *(volatile uint32_t *)&jp[ch & 15];
 #pragma unroll
     for (int ks = 0; ks < 2; ks++) {
       uint32_t af[4][4];
@@ -660,7 +665,7 @@ k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int 
         }
       }
     }
-    if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
+    if (chunk_end) {  // конец чанка r: XOR тайла, rotl13, запись слова jackpot
       uint32_t xp[4];
 #pragma unroll
       for (int c = 0; c < 4; c++) {
@@ -671,8 +676,7 @@ k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int 
           for (int j = 0; j < 8; j++) xp[c] ^= (uint32_t)acc[i][j][c];
       }
       uint32_t x = (xp[0] ^ xp[1]) ^ (xp[2] ^ xp[3]);
-      const uint32_t v = jp[ch & 15];
-      jp[ch & 15] = ((v << 13) | (v >> 19)) ^ x;
+      *(volatile uint32_t *)&jp[ch & 15] = ((jv << 13) | (jv >> 19)) ^ x;
       ch++;
     }
     st ^= 1;
