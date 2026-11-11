@@ -14,7 +14,7 @@ else
   [[ -z $temp ]] && temp='[]'; [[ -z $fan ]] && fan='[]'
   khs=$(jq '[.hs[]] | add / 1000' "$F")
   stats=$(jq -c --argjson t "$temp" --argjson f "$fan" \
-    '{hs:.hs, hs_units:"hs", temp:$t, fan:$f, uptime:.uptime, ver:.ver,
+    '{hs:[.hs[] | ./1e6 | floor], hs_units:"mhs", temp:$t, fan:$f, uptime:.uptime, ver:.ver,
       ar:[0,0], algo:"pearlhash", bus_numbers:.bus}' "$F")
 fi
 [[ -z $khs ]] && khs=0
