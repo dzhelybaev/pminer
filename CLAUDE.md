@@ -28,6 +28,7 @@ v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
 - `hiveos/` — h-manifest.conf, h-config.sh, h-run.sh, h-stats.sh
 - `tools/ncu.sh` — профиль k_gemm под Nsight Compute на риге (скачивает ncu 2025.2.1 в /root/ncu,
   останавливает майнер, по одному запуску на карту с параметрами автонастройки → /root/ncu/gpuN.txt)
+- `tools/ncu_sum.sh` — выжимка отчётов ncu: простои warp по причинам, загрузка конвейеров SM, L2/DRAM
 - `build.sh` — сборка бинарника и пакета `dist/pminer-<ver>.tar.gz`
 - `dist/` — готовый пакет для HiveOS (коммитится, ссылка raw)
 - `ref/pearlhash_ref.py` — эталон pearlhash на numpy (dense, сертификат V3 salted)
