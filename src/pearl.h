@@ -38,11 +38,16 @@ inline void config_bytes(uint8_t out[52]) {
   memcpy(out + 14, COLS_PATTERN, 6);
 }
 
-inline void job_key(const Header &h, uint8_t out[32]) {
+inline void job_key_raw(const uint8_t hdr[76], uint8_t out[32]) {
   uint8_t buf[128];
-  header_bytes(h, buf);
+  memcpy(buf, hdr, 76);
   config_bytes(buf + 76);
   b3::hash_small(buf, 128, nullptr, out);
+}
+inline void job_key(const Header &h, uint8_t out[32]) {
+  uint8_t hb[76];
+  header_bytes(h, hb);
+  job_key_raw(hb, out);
 }
 
 // V3: hash' = blake3_keyed(SALT, hash | dim_le32 | 0*28)
@@ -54,17 +59,31 @@ inline void salt(const uint8_t hash[32], uint32_t dim, const char *ctx, uint8_t 
   b3::hash_small(msg, 64, key, out);
 }
 
-inline void seed_b(const uint8_t jk[32], const uint8_t hash_b[32], uint32_t n, uint8_t out[32]) {
+// salted = сертификат V3 (с высоты 99000); V1/V2 — хэши без «соли»
+inline void seed_b(const uint8_t jk[32], const uint8_t hash_b[32], uint32_t n, uint8_t out[32], bool salted = true) {
   uint8_t hb[32], msg[64];
-  salt(hash_b, n, "pearl/cert-v3/noise-seed/B", hb);
+  if (salted) salt(hash_b, n, "pearl/cert-v3/noise-seed/B", hb); else memcpy(hb, hash_b, 32);
   memcpy(msg, jk, 32); memcpy(msg + 32, hb, 32);
   b3::hash_small(msg, 64, nullptr, out);
 }
-inline void seed_a(const uint8_t bseed[32], const uint8_t hash_a[32], uint32_t m, uint8_t out[32]) {
+inline void seed_a(const uint8_t bseed[32], const uint8_t hash_a[32], uint32_t m, uint8_t out[32], bool salted = true) {
   uint8_t ha[32], msg[64];
-  salt(hash_a, m, "pearl/cert-v3/noise-seed/A", ha);
+  if (salted) salt(hash_a, m, "pearl/cert-v3/noise-seed/A", ha); else memcpy(ha, hash_a, 32);
   memcpy(msg, bseed, 32); memcpy(msg + 32, ha, 32);
   b3::hash_small(msg, 64, nullptr, out);
+}
+
+// граница из цели пула: target · TILE_H·TILE_W·K (= 2^19), насыщение до 2^256-1; LE слова
+inline void bound_from_target(const uint8_t target_le[32], uint32_t out[8]) {
+  static_assert(TILE_H * TILE_W * K == (1 << 19), "множитель границы — 2^19");
+  const int sh = 19;
+  uint32_t t[8];
+  b3::load_words(target_le, t, 8);
+  if (t[7] >> (32 - sh)) {  // старшие биты уходят за 256 → максимум
+    for (int w = 0; w < 8; w++) out[w] = 0xffffffffu;
+    return;
+  }
+  for (int w = 7; w >= 0; w--) out[w] = (t[w] << sh) | (w ? t[w - 1] >> (32 - sh) : 0);
 }
 
 // граница: target(nbits) * TILE_H*TILE_W*K, насыщение до 2^256-1; 8 слов LE

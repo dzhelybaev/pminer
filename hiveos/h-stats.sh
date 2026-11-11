@@ -15,7 +15,7 @@ else
   khs=$(jq '[.hs[]] | add / 1000' "$F")
   stats=$(jq -c --argjson t "$temp" --argjson f "$fan" \
     '{hs:[.hs[] | ./1e6 | floor], hs_units:"mhs", temp:$t, fan:$f, uptime:.uptime, ver:.ver,
-      ar:[(.acc // 0),0], algo:"pearlhash", bus_numbers:.bus}' "$F")
+      ar:[(.acc // 0),(.rej // 0)], algo:"pearlhash", bus_numbers:.bus}' "$F")
 fi
 [[ -z $khs ]] && khs=0
 [[ -z $stats ]] && stats=null

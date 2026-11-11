@@ -1,2 +1,4 @@
 build/
 *.o
+third_party/
+pool/target/

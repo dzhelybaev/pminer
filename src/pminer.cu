@@ -13,6 +13,7 @@
 #include <thread>
 #include <vector>
 #include "kernels.cuh"
+#include "pool.h"
 #include "pearl.h"
 #include "selftest.h"
 
@@ -70,6 +71,8 @@ struct Miner {
   unsigned *hCount = nullptr;  // pinned
   cudaEvent_t done = nullptr;  // конец пакета; BlockingSync — поток CPU спит, а не крутится
   b3::Pow2Tree treeA;
+  std::vector<int8_t> hA, hB;  // базовые A (m×k) и B^T (n×k) на хосте — для доказательств
+  bool salted = true;          // сиды V3 (cert_version ≥ 3)
   uint8_t jk[32], bseed[32];
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
@@ -105,6 +108,7 @@ struct Miner {
       if (l.st) cudaStreamDestroy(l.st);
       l = Lane();
     }
+    hA.clear(); hB.clear();
     void *p[] = {dB, dBp, dE, dCount, dHits, dDigest};
     for (void *q : p) if (q) cudaFree(q);
     if (hCount) cudaFreeHost(hCount);
@@ -113,20 +117,33 @@ struct Miner {
     dB = dBp = dE = nullptr; dCount = hCount = nullptr; dHits = nullptr; dDigest = nullptr;
   }
 
-  // новая задача: заголовок, матрицы A и B^T, дерево A, шум B
+  // тестовая задача из заголовка-структуры и nbits
   bool job(const pearl::Header &h) {
-    pearl::job_key(h, jk);
+    uint8_t hb[76];
+    pearl::header_bytes(h, hb);
     uint32_t bw[8];
     pearl::bound(h.nbits, bw);
-    memcpy(bnd.w, bw, 32);
-    std::vector<int8_t> A((size_t)m * k), B((size_t)n * k);
-    pearl::fill(A, (uint32_t)seedA);
-    pearl::fill(B, (uint32_t)seedB);
-    treeA.build((const uint8_t *)A.data(), A.size(), jk);
+    return job_raw(hb, bw, true);
+  }
+
+  // задача: заголовок (76 Б), граница, вид сидов. Матрицы A и B^T генерируются один раз
+  // на размер; на каждую задачу пересчитываются дерево A, хэш B (ключ — job_key) и шум B
+  bool job_raw(const uint8_t hdr[76], const uint32_t bound[8], bool salted_) {
+    salted = salted_;
+    pearl::job_key_raw(hdr, jk);
+    memcpy(bnd.w, bound, 32);
+    bool fresh = hA.size() != (size_t)m * k || hB.size() != (size_t)n * k;
+    if (fresh) {
+      hA.assign((size_t)m * k, 0);
+      hB.assign((size_t)n * k, 0);
+      pearl::fill(hA, (uint32_t)seedA);
+      pearl::fill(hB, (uint32_t)seedB);
+    }
+    treeA.build((const uint8_t *)hA.data(), hA.size(), jk);
     uint8_t hb[32];  // n — любое кратное 128, поэтому общий хэш, а не дерево степени двойки
-    b3::hash_large((const uint8_t *)B.data(), B.size(), jk, hb);
-    pearl::seed_b(jk, hb, n, bseed);
-    CK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
+    b3::hash_large((const uint8_t *)hB.data(), hB.size(), jk, hb);
+    pearl::seed_b(jk, hb, n, bseed, salted);
+    if (fresh) CK(cudaMemcpy(dB, hB.data(), hB.size(), cudaMemcpyHostToDevice));
     kern::Seed s = to_seed(bseed);
     kern::k_uniform<<<(n * r / 32 + 255) / 256, 256>>>(dE, n, r, s, false);
     kern::k_perm<<<((k + 7) / 8 + 127) / 128, 128>>>(ln[0].dF, ln[0].dS, k, r, s, false);
@@ -174,7 +191,7 @@ struct Miner {
     pearl::chunk0(seedN, nonce, c0);  // на GPU тот же чанк считается в k_apply_fused
     uint8_t ha[32], aseed[32];
     treeA.root_with_chunk0((const uint8_t *)c0, ha);
-    pearl::seed_a(bseed, ha, m, aseed);
+    pearl::seed_a(bseed, ha, m, aseed, salted);
     Lane &l = ln[slot % lanes];
     kern::Seed s = to_seed(aseed);
     if (with_digest) CK(cudaMemsetAsync(dDigest, 0, 32, l.st));
@@ -184,8 +201,9 @@ struct Miner {
     return true;
   }
 
-  // пакет из cnt попыток; возвращает сумму удач
-  bool batch(uint64_t nonce0, uint64_t step, int cnt, unsigned &hits) {
+  // пакет из cnt попыток; возвращает сумму удач. on_hit(nonce, row0, col0) — для каждой удачи
+  template <class F>
+  bool batch(uint64_t nonce0, uint64_t step, int cnt, unsigned &hits, F &&on_hit) {
     for (int s = 0; s < cnt; s++)
       if (!enqueue(nonce0 + s * step, s, false)) return false;
     for (int i = 1; i < lanes; i++) {  // событие в полосе 0 ждёт остальные полосы
@@ -196,8 +214,28 @@ struct Miner {
     CK(cudaEventSynchronize(done));
     CK(cudaMemcpy(hCount, dCount, cnt * sizeof(unsigned), cudaMemcpyDeviceToHost));
     hits = 0;
-    for (int s = 0; s < cnt; s++) hits += hCount[s];
+    for (int s = 0; s < cnt; s++) {
+      hits += hCount[s];
+      if (!hCount[s]) continue;
+      int nh = std::min<int>(hCount[s], MAX_HITS);
+      std::vector<kern::Hit> hv(nh);
+      CK(cudaMemcpy(hv.data(), dHits + s * MAX_HITS, nh * sizeof(kern::Hit), cudaMemcpyDeviceToHost));
+      for (auto &h : hv) on_hit(nonce0 + s * step, h.row0, h.col0);
+    }
     return true;
+  }
+  bool batch(uint64_t nonce0, uint64_t step, int cnt, unsigned &hits) {
+    return batch(nonce0, step, cnt, hits, [](uint64_t, uint32_t, uint32_t) {});
+  }
+
+  // шар в пул: полная A с чанком 0 этой попытки, строки/столбцы тайла
+  void submit(const PmJob &job, uint64_t nonce, uint32_t row0, uint32_t col0) {
+    std::vector<int8_t> A(hA);
+    pearl::chunk0(seedN, nonce, A.data());
+    uint32_t rows[pearl::TILE_H], cols[pearl::TILE_W];
+    for (int i = 0; i < pearl::TILE_H; i++) rows[i] = row0 + 8 * i;
+    for (int j = 0; j < pearl::TILE_W / 2; j++) { cols[2 * j] = col0 + 8 * j; cols[2 * j + 1] = col0 + 8 * j + 1; }
+    pm_pool_submit(&job, A.data(), m, hB.data(), n, k, r, rows, pearl::TILE_H, cols, pearl::TILE_W, g->id);
   }
 };
 
@@ -220,16 +258,35 @@ static bool selftest(Gpu *g, int bm) {
   uint32_t dig[8] = {0};
   ok = ok && mn.enqueue(0, 0, true) && ck(cudaDeviceSynchronize(), g, "sync") && ck(cudaMemcpy(&hits, mn.dCount, 4, cudaMemcpyDeviceToHost), g, "hits") &&
        ck(cudaMemcpy(dig, mn.dDigest, 32, cudaMemcpyDeviceToHost), g, "digest");
+  // координаты первой удачи с GPU → доказательство официальным кодом Pearl → проверка
+  int proof_ok = -1;
+  if (ok && hits > 0) {
+    kern::Hit h0;
+    ok = ck(cudaMemcpy(&h0, mn.dHits, sizeof h0, cudaMemcpyDeviceToHost), g, "hit");
+    if (ok) {
+      std::vector<int8_t> A(mn.hA);
+      pearl::chunk0(mn.seedN, 0, A.data());
+      uint32_t rows[pearl::TILE_H], cols[pearl::TILE_W];
+      for (int i = 0; i < pearl::TILE_H; i++) rows[i] = h0.row0 + 8 * i;
+      for (int j = 0; j < pearl::TILE_W / 2; j++) { cols[2 * j] = h0.col0 + 8 * j; cols[2 * j + 1] = h0.col0 + 8 * j + 1; }
+      pearl::Header th = test_header(0x1e100000, 0);
+      uint8_t hb[76];
+      pearl::header_bytes(th, hb);
+      proof_ok = pm_verify_tile(hb, A.data(), mn.m, mn.hB.data(), mn.n, mn.k, mn.r, rows, pearl::TILE_H, cols,
+                                pearl::TILE_W, 3, th.nbits) == 0;
+    }
+  }
   mn.release();
   if (!ok) return false;
-  bool pass = hits == SELFTEST_HITS && !memcmp(dig, SELFTEST_DIGEST, 32);
-  LOG("GPU%d selftest блок %d: %s (hits %u/%u, digest %08x.. ожид. %08x..)\n", g->id, bm, pass ? "OK" : "FAIL", hits,
-      SELFTEST_HITS, dig[0], SELFTEST_DIGEST[0]);
+  bool pass = hits == SELFTEST_HITS && !memcmp(dig, SELFTEST_DIGEST, 32) && proof_ok == 1;
+  LOG("GPU%d selftest блок %d: %s (hits %u/%u, digest %08x.. ожид. %08x.., доказательство %s)\n", g->id, bm,
+      pass ? "OK" : "FAIL", hits, SELFTEST_HITS, dig[0], SELFTEST_DIGEST[0], proof_ok == 1 ? "OK" : "FAIL");
   return pass;
 }
 
 struct Opts { int m = 0, n = 0, lanes = 0, bm = 0;  // 0 — автонастройка
-  uint32_t nbits = 0x1c020000; bool selftest_only = false; };
+  uint32_t nbits = 0x1c020000; bool selftest_only = false;
+  bool pool = false; };
 
 static void worker(Gpu *g, Opts o, int ngpu) {
   if (!ck(cudaSetDevice(g->id), g, "cudaSetDevice")) return;
@@ -307,13 +364,37 @@ static void worker(Gpu *g, Opts o, int ngpu) {
         g->id, mac1 / t[0] / 1e9, mac1 / t[1] / 1e9, mac1 / t[2] / 1e9, mac1 / t[3] / 1e9);
     if (!ck(cudaDeviceSynchronize(), g, "diag")) return;
   }
-  g->state = 1;
   const double mac = (double)o.m * o.n * pearl::K;
+  PmJob job{};
+  uint64_t job_serial = 0;
+  if (!o.pool) g->state = 1;
   auto t0 = std::chrono::steady_clock::now();
   int it = 0;
   while (true) {
+    if (o.pool) {  // новое задание пула → пересчёт задачи; без задания ждём
+      PmJob nj;
+      uint64_t s = pm_pool_job(&nj);
+      if (!s) {
+        g->state = 0;
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        continue;
+      }
+      if (s != job_serial) {
+        uint32_t bw[8];
+        pearl::bound_from_target(nj.target_le, bw);
+        if (!mn.job_raw(nj.header, bw, nj.cert_version >= 3)) break;
+        job = nj;
+        job_serial = s;
+        g->state = 1;
+        it = 0;
+        t0 = std::chrono::steady_clock::now();
+      }
+    }
     unsigned h = 0;
-    if (!mn.batch(nonce, ngpu, best_bs, h)) break;
+    bool ok = o.pool ? mn.batch(nonce, ngpu, best_bs, h,
+                                [&](uint64_t nc, uint32_t r0, uint32_t c0) { mn.submit(job, nc, r0, c0); })
+                     : mn.batch(nonce, ngpu, best_bs, h);
+    if (!ok) break;
     nonce += (uint64_t)ngpu * best_bs;
     g->hits += h;
     it += best_bs;
@@ -332,6 +413,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
 
 int main(int argc, char **argv) {
   const char *stats = "/run/pminer/stats.json";
+  const char *pool_url = nullptr, *wallet = nullptr, *pass = "x";
   Opts o;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--stats") && i + 1 < argc) stats = argv[++i];
@@ -341,13 +423,27 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
+    else if (!strcmp(argv[i], "--pool") && i + 1 < argc) pool_url = argv[++i];
+    else if (!strcmp(argv[i], "--wallet") && i + 1 < argc) wallet = argv[++i];
+    else if (!strcmp(argv[i], "--pass") && i + 1 < argc) pass = argv[++i];
   }
   if (o.m % 256 || o.n % 128 || (o.bm && o.bm != 128 && o.bm != 256) || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || o.m < 0 || o.n < 0) {
     fprintf(stderr, "pminer: --m (≥256) — степень двойки, --n — кратно 128; --bm 128|256; --lanes 1|2\n");
     return 1;
   }
-  printf("pminer %s: pearlhash dense V3, k=%d r=%d тайл %dx%d, nbits=%08x (тест, без пула)\n",
-         PMINER_VERSION, pearl::K, pearl::R, pearl::TILE_H, pearl::TILE_W, o.nbits);
+  if (pool_url && *pool_url && !o.selftest_only) {
+    if (!wallet || !*wallet) {
+      fprintf(stderr, "pminer: для пула нужен --wallet КОШЕЛЁК.ВОРКЕР\n");
+      return 1;
+    }
+    std::string agent = std::string("pminer/") + PMINER_VERSION;
+    if (pm_pool_start(pool_url, wallet, pass, agent.c_str()) != 0) return 1;
+    o.pool = true;
+    printf("pminer %s: pearlhash, пул %s, кошелёк %s\n", PMINER_VERSION, pool_url, wallet);
+  } else {
+    printf("pminer %s: pearlhash dense V3, k=%d r=%d тайл %dx%d, nbits=%08x (тест, без пула)\n",
+           PMINER_VERSION, pearl::K, pearl::R, pearl::TILE_H, pearl::TILE_W, o.nbits);
+  }
   int n = 0;
   if (cudaGetDeviceCount(&n) != cudaSuccess || n == 0) {
     fprintf(stderr, "pminer: CUDA GPU не найдены\n");
@@ -391,14 +487,24 @@ int main(int argc, char **argv) {
       snprintf(b, sizeof b, "%s%d", i ? "," : "", gpus[i].bus); bus += b;
       snprintf(b, sizeof b, "%s\"%s\"", i ? "," : "", gpus[i].busid); busid += b;
       const char *st = gpus[i].state == 1 ? "" : gpus[i].state < 0 ? " [ОШИБКА]" : " [старт]";
-      LOG("GPU%d %s: %.2f TH/s, удач %u, попытка %.2f мс%s\n", i, gpus[i].name.c_str(), h / 1e12,
-          gpus[i].hits.load(), gpus[i].ms.load(), st);
+      LOG("GPU%d %s: %.2f TH/s, %s %u, попытка %.2f мс%s\n", i, gpus[i].name.c_str(), h / 1e12,
+          o.pool ? "шаров" : "удач", gpus[i].hits.load(), gpus[i].ms.load(), st);
     }
-    LOG("Total: %.2f TH/s, удач %u\n", total / 1e12, acc);
+    uint64_t pacc = 0, prej = 0, pst = 0;
+    int pcon = 0;
+    if (o.pool) {  // в режиме пула «принято/отклонено» — ответы пула
+      pm_pool_stats(&pacc, &prej, &pst, &pcon);
+      LOG("Total: %.2f TH/s, найдено шаров %u, принято %llu, отклонено %llu, устарело %llu%s\n", total / 1e12, acc,
+          (unsigned long long)pacc, (unsigned long long)prej, (unsigned long long)pst, pcon ? "" : " [нет связи с пулом]");
+    } else {
+      LOG("Total: %.2f TH/s, удач %u\n", total / 1e12, acc);
+      pacc = acc;
+    }
     FILE *f = fopen(tmp.c_str(), "w");
     if (f) {
-      fprintf(f, "{\"ver\":\"%s\",\"uptime\":%ld,\"hs\":%s],\"bus\":%s],\"busid\":%s],\"acc\":%u}\n",
-              PMINER_VERSION, up, hs.c_str(), bus.c_str(), busid.c_str(), acc);
+      fprintf(f, "{\"ver\":\"%s\",\"uptime\":%ld,\"hs\":%s],\"bus\":%s],\"busid\":%s],\"acc\":%llu,\"rej\":%llu}\n",
+              PMINER_VERSION, up, hs.c_str(), bus.c_str(), busid.c_str(), (unsigned long long)pacc,
+              (unsigned long long)(prej + pst));
       fclose(f);
       rename(tmp.c_str(), stats);
     }

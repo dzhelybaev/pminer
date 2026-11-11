@@ -4,10 +4,11 @@
 Свой GPU-майнер Pearl под RTX 5060 (sm_120), 4060 (sm_89), 3060 (sm_86), 2060 Super (sm_75).
 Запуск через HiveOS «Custom miner».
 
-## Текущий этап (v0.10)
-Настоящий pearlhash на GPU (dense, V3), но без пула: тестовый заголовок, nbits по умолчанию
-0x1c020000 (~1 «удача» на попытку). При старте каждая GPU проходит самотест против эталона
-(m=256, n=128): при FAIL карта не майнит (хэшрейт 0, в логе «selftest FAIL»).
+## Текущий этап (v0.11)
+Майнинг в пул (stratum, диалект «объектов» + Kryptex v2 gzip). Без --pool — тестовый режим:
+тестовый заголовок, nbits 0x1c020000 (~1 «удача» на попытку). При старте каждая GPU проходит
+самотест против эталона (m=256, n=128) и проверку доказательства для первой удачи официальным
+верификатором Pearl: при FAIL карта не майнит.
 Хэшрейт = m·n·k / время попытки (MAC/s ≈ TH/s pearlhash).
 v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
 
@@ -16,6 +17,11 @@ v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
 - `src/kernels.cuh` — CUDA: k_uniform/k_perm/k_apply (шум), k_gemm (NoisyGEMM+jackpot+blake3)
 - `src/blake3.h` — BLAKE3 (host+device), дерево для степени двойки чанков (A), hash_large для любой длины (B)
 - `src/pearl.h` — заголовок/конфиг, сиды V3, граница, ГПСЧ splitmix для матриц
+- `src/pool.h` — C ABI библиотеки pool/ (Rust)
+- `pool/` — Rust staticlib: PlainProof официальным кодом Pearl (zk-pow, pearl-blake3 из
+  third_party/pearl, коммит 0dbdb2f — build.sh скачивает сам), локальная проверка, base64/gzip,
+  stratum-клиент (TCP/TLS rustls, переподключение). Тесты без GPU: `cd pool && cargo test --release`
+  (доказательства удач/промахов + поддельный пул на localhost)
 - `src/selftest.h` — ожидаемые значения самотеста (генерирует `ref/selftest_gen.py`)
 - `tests/host_test.cpp` + `tests/host_test.py` — сверка хостовой части с эталоном (без GPU):
   `g++ -O2 -std=c++17 -Wno-unknown-pragmas -o /tmp/ht tests/host_test.cpp && /tmp/ht > /tmp/ht.txt && python3 tests/host_test.py /tmp/ht.txt`
@@ -28,13 +34,16 @@ v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
   генерация векторов: `cargo test --release --lib pminer_dump_vectors` → /tmp/pearl_vectors.json
 
 ## Сборка
-CUDA 12.8+ на Ubuntu 20.04 (glibc 2.31 — совместимость с HiveOS):
-`NVCC=/usr/local/cuda-12.8/bin/nvcc ./build.sh`
+CUDA 12.8+ и Rust на Ubuntu 20.04 (glibc 2.31 — совместимость с HiveOS):
+`NVCC=/usr/local/cuda-12.8/bin/nvcc CARGO=~/.cargo/bin/cargo ./build.sh`
+(здесь — chroot /opt/focal с /proc и /dev, rust скопирован из /root/.rustup и /root/.cargo хоста)
 
 ## HiveOS
 Flight Sheet → Miner: Custom → Setup:
 - Installation URL: `https://github.com/dzhelybaev/pminer/raw/version/vX.Y/dist/pminer-X.Y.tar.gz`
-- Hash algorithm: любой; Wallet/Pool: любые (пока не используются)
+- Hash algorithm: любой; Wallet and worker template: `%WAL%.%WORKER_NAME%`;
+  Pool URL: `stratum+tcp://host:port` или `stratum+ssl://…`; Pass: обычно `x`
+- h-config.sh превращает это в `--pool URL --wallet TEMPLATE --pass PASS` + Extra config
 Лог: `/var/log/miner/pminer/pminer.log`, статистика: `/run/pminer/stats.json`.
 Драйвер NVIDIA ≥ 570 (нужен для RTX 50xx и CUDA 12.8).
 
@@ -46,7 +55,8 @@ Flight Sheet → Miner: Custom → Setup:
 
 ## Известные проблемы
 - HiveOS, похоже, обрезает per-GPU хэшрейт в hs_units "hs" (показывал 1000.0) — отдаём в "mhs"
-- pminer пока не подключается к пулу: любые сообщения пула не от него
+- позиционный диалект stratum (alphapool: configure/subscribe, params-массивы) не поддерживается
+- проверено только на поддельном пуле и самотесте; на реальном пуле — нет (v0.11)
 - Репозиторий публичный: нужен для скачивания пакета HiveOS по raw-ссылке
 
 ## Алгоритм pearlhash (проверено эталоном)
@@ -123,9 +133,20 @@ Flight Sheet → Miner: Custom → Setup:
 - v0.10 (исправление, пакет ~8 мс): 5060 48.9, 4060 39.3, 2060S 25.9 = 114.1 TH/s, LA ~1.2.
   Выбрано: 5060/4060 m=512 n=4096 2 полосы (пакет 28/26), 2060S m=8192 n=16384 2 полосы
 
+## Пул (v0.11)
+- authorize {wallet: кошелёк.воркер, worker, pass, agent, type:"v2"}; если пул ответил type v2 —
+  plain_proof = base64(gzip(bincode)), иначе base64(bincode)
+- notify {job_id, header hex 76 Б, target hex U256 big-endian, height[, cert_version — по умолч. 3]}
+- граница шара = target · 2^19 (h·w·k при r=128); удача → строки row0+8i, столбцы col0+8j+{0,1}
+- шар: копия A (с чанком 0 попытки) и B → фоновый поток Rust: MerkleTree, PlainProof,
+  verify_plain_proof с nbits = цель пула, округлённая вверх → mining.submit; неверное не отправляется
+- новое задание → пересчёт дерева A, хэша B и шума B (матрицы те же); попытка = пакет
+- stats.json: acc/rej — ответы пула (rej включает устаревшие)
+
 ## Бэклог
 1. ~~Эталон pearlhash на Python~~ — готов, совпадает с Rust-кодом Pearl
 2. ~~CUDA-ядро v0.2~~ — проверить самотест и скорость на картах
 2a. Скорость: 3–4 стадии, BK=128, больше warp, перекрытие шума A с GEMM, двойной буфер A'
-3. Stratum-клиент пула, доказательства через zk-pow (Rust)
+3. ~~Stratum-клиент пула, доказательства через zk-pow~~ (v0.11) — проверить на реальном пуле;
+   разреженные матрицы для лучшего сжатия gzip; позиционный диалект
 4. Тюнинг под каждую архитектуру (Nsight Compute)
