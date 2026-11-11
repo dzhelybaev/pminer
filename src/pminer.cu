@@ -15,6 +15,7 @@
 #include <vector>
 #include "kernels.cuh"
 #include "pool.h"
+#include "nvml.h"
 #include "pearl.h"
 #include "selftest.h"
 
@@ -35,6 +36,7 @@ struct Gpu {
   std::atomic<unsigned> hits{0};
   std::atomic<int> state{0};
   std::atomic<double> ms{0};  // среднее время попытки  // 0 старт, 1 работает, -1 ошибка
+  nvml::Power pw;  // v0.23: мощность из NVML (только поток статистики)
 };
 
 static bool ck(cudaError_t e, Gpu *g, const char *what) {
@@ -597,6 +599,8 @@ int main(int argc, char **argv) {
     gpus[i].bus = p.pciBusID;
     gpus[i].name = p.name;
     snprintf(gpus[i].busid, sizeof gpus[i].busid, "%02x:%02x.0", p.pciBusID, p.pciDeviceID);
+    char pci[32] = "";
+    if (cudaDeviceGetPCIBusId(pci, sizeof pci, i) == cudaSuccess) gpus[i].pw.init(pci);
     printf("GPU%d %s sm_%d%d SM=%d L2=%d МБ (закрепить можно %d МБ, окно %d МБ) bus %s\n", i, p.name, p.major,
            p.minor, p.multiProcessorCount, p.l2CacheSize >> 20, (int)(p.persistingL2CacheMaxSize >> 20),
            p.accessPolicyMaxWindowSize >> 20, gpus[i].busid);
@@ -618,7 +622,9 @@ int main(int argc, char **argv) {
     long up = (long)std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     double total = 0;
     unsigned acc = 0;
-    std::string hs = "[", bus = "[", busid = "[";
+    std::string hs = "[", bus = "[", busid = "[", pwr = "[";
+    double wsum = 0;
+    bool wall = true;
     for (int i = 0; i < n; i++) {
       double h = gpus[i].state == 1 ? gpus[i].hs.load() : 0;
       total += h;
@@ -628,11 +634,19 @@ int main(int argc, char **argv) {
       snprintf(b, sizeof b, "%s%d", i ? "," : "", gpus[i].bus); bus += b;
       snprintf(b, sizeof b, "%s\"%s\"", i ? "," : "", gpus[i].busid); busid += b;
       const char *st = gpus[i].state == 1 ? "" : gpus[i].state < 0 ? " [ОШИБКА]" : " [старт]";
-      LOG("GPU%d %s: %.2f TH/s, %s %u, попытка %.2f мс%s\n", i, gpus[i].name.c_str(), h / 1e12,
+      const double w = gpus[i].pw.watts();
+      char ws[64] = "";
+      if (w > 0) {
+        snprintf(ws, sizeof ws, ", %.0f Вт (%.2f TH/Вт)", w, h / 1e12 / w);
+        wsum += w;
+      } else wall = false;
+      snprintf(b, sizeof b, "%s%.0f", i ? "," : "", w > 0 ? w : 0); pwr += b;
+      LOG("GPU%d %s: %.2f TH/s%s, %s %u, попытка %.2f мс%s\n", i, gpus[i].name.c_str(), h / 1e12, ws,
           o.pool ? "шаров" : "удач", gpus[i].hits.load(), gpus[i].ms.load(), st);
     }
     uint64_t pacc = 0, prej = 0, pst = 0;
     int pcon = 0;
+    if (wall && wsum > 0) LOG("Мощность карт: %.0f Вт, %.3f TH/Вт\n", wsum, total / 1e12 / wsum);
     if (o.pool) {  // в режиме пула «принято/отклонено» — ответы пула
       pm_pool_stats(&pacc, &prej, &pst, &pcon);
       LOG("Total: %.2f TH/s, найдено шаров %u, принято %llu, отклонено %llu, устарело %llu%s\n", total / 1e12, acc,
@@ -643,8 +657,8 @@ int main(int argc, char **argv) {
     }
     FILE *f = fopen(tmp.c_str(), "w");
     if (f) {
-      fprintf(f, "{\"ver\":\"%s\",\"uptime\":%ld,\"hs\":%s],\"bus\":%s],\"busid\":%s],\"acc\":%llu,\"rej\":%llu}\n",
-              PMINER_VERSION, up, hs.c_str(), bus.c_str(), busid.c_str(), (unsigned long long)pacc,
+      fprintf(f, "{\"ver\":\"%s\",\"uptime\":%ld,\"hs\":%s],\"bus\":%s],\"busid\":%s],\"power\":%s],\"acc\":%llu,\"rej\":%llu}\n",
+              PMINER_VERSION, up, hs.c_str(), bus.c_str(), busid.c_str(), pwr.c_str(), (unsigned long long)pacc,
               (unsigned long long)(prej + pst));
       fclose(f);
       rename(tmp.c_str(), stats);
