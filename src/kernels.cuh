@@ -229,7 +229,10 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, int8_t *s
 // A' (m×k), B'^T (n×k): int8, k-непрерывные. k кратно BK, r кратно BK.
 // Сетка одномерная, порядок блоков сгруппирован по GROUP_M строк блоков —
 // одновременно работающие блоки делят панели A и B в L2.
-template <int BM>
+// MODE — диагностика узких мест (0 = рабочий режим):
+// 1 — без загрузок global→smem в цикле; 2 — ещё и без барьеров; 3 — ещё и без ldmatrix
+// (фрагменты загружены один раз). Результат в режимах 1–3 бессмысленный, важна только скорость.
+template <int BM, int MODE = 0>
 __global__ void __launch_bounds__(BM, BM == 128 ? 2 : 1)
 k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
@@ -268,21 +271,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_seg = lane >> 4;
   const int b_row = (lane & 7) + 8 * (lane >> 4), b_seg = (lane >> 3) & 1;
 
-  int st = 0;
-  for (int kt = 0; kt < KT; kt++) {
-    cp_wait<STAGES - 2>();
-    __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
-    const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
-#if __CUDA_ARCH__ >= 800
-    if (nk < KT) { load_tile<BM, NTHR>(sA[ns], gA + nk * BK, k, t); load_tile<BN, NTHR>(sB[ns], gB + nk * BK, k, t); }
-    cp_commit();
-#else
-    constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
-    RegStage<SA, SB> rg;
-    if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
-#endif
-    {  // два шага k32: сначала все ldmatrix обоих шагов, потом все mma
-      uint32_t af[2][4][4], bf[2][8][2];
+  uint32_t af[2][4][4], bf[2][8][2];  // фрагменты двух шагов k32
+  auto load_frags = [&](int st) {
 #pragma unroll
       for (int ks = 0; ks < 2; ks++) {
 #pragma unroll
@@ -294,6 +284,28 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
           ldsm4(bf[ks][2 * j][0], bf[ks][2 * j][1], bf[ks][2 * j + 1][0], bf[ks][2 * j + 1][1],
                 &sB[st][sw(wn + 16 * j + b_row, 2 * ks + b_seg)]);
       }
+  };
+  if constexpr (MODE >= 3) { cp_wait<0>(); __syncthreads(); load_frags(0); }
+
+  int st = 0;
+  for (int kt = 0; kt < KT; kt++) {
+    if constexpr (MODE < 2) {
+      cp_wait<STAGES - 2>();
+      __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
+    }
+    const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
+#if __CUDA_ARCH__ >= 800
+    if constexpr (MODE < 1)
+      if (nk < KT) { load_tile<BM, NTHR>(sA[ns], gA + nk * BK, k, t); load_tile<BN, NTHR>(sB[ns], gB + nk * BK, k, t); }
+    cp_commit();
+#else
+    constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
+    [[maybe_unused]] RegStage<SA, SB> rg;
+    if constexpr (MODE < 1)
+      if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
+#endif
+    {  // два шага k32: сначала все ldmatrix обоих шагов, потом все mma
+      if constexpr (MODE < 3) load_frags(st);
 #pragma unroll
       for (int ks = 0; ks < 2; ks++)
 #pragma unroll
@@ -318,7 +330,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
       jp[15] = nv;
     }
 #if __CUDA_ARCH__ < 800
-    if (nk < KT) store_regs<NTHR>(rg, sA[ns], sB[ns], t);
+    if constexpr (MODE < 1)
+      if (nk < KT) store_regs<NTHR>(rg, sA[ns], sB[ns], t);
 #endif
     st = st == STAGES - 1 ? 0 : st + 1;
   }

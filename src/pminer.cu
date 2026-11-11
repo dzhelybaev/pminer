@@ -146,6 +146,25 @@ struct Miner {
       kern::k_gemm<256><<<blocks, 256, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
   }
 
+  // диагностика: время одного GEMM (мс) в режиме MODE на полосе 0, только блок 128
+  template <int MODE> float diag_gemm(const kern::Seed &s, int reps) {
+    cudaFuncSetAttribute(kern::k_gemm<128, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+    Lane &l = ln[0];
+    int blocks = (m / 128) * (n / kern::BN);
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    kern::k_gemm<128, MODE><<<blocks, 128, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+    cudaEventRecord(e0, l.st);
+    for (int i = 0; i < reps; i++)
+      kern::k_gemm<128, MODE><<<blocks, 128, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+    cudaEventRecord(e1, l.st);
+    cudaEventSynchronize(e1);
+    float ms = 0;
+    cudaEventElapsedTime(&ms, e0, e1);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+    return ms / reps;
+  }
+
   // постановка попытки в поток полосы (без синхронизации); slot — место в пакете
   bool enqueue(uint64_t nonce, int slot, bool with_digest) {
     int8_t c0[1024];
@@ -253,6 +272,17 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   LOG("GPU%d выбрано: блок %d m=%d n=%d полос %d (L2 %d МБ)\n", g->id, best.bm, best.m, best.n, best.lanes,
       p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
+  if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
+    uint8_t sd[32] = {1};
+    kern::Seed s = to_seed(sd);
+    mn.noise_a(mn.ln[0], s, 1, nullptr);
+    const int reps = (double)o.m * o.n > 2e7 ? 5 : 50;
+    double mac1 = (double)o.m * o.n * pearl::K;
+    float t[4] = {mn.diag_gemm<0>(s, reps), mn.diag_gemm<1>(s, reps), mn.diag_gemm<2>(s, reps), mn.diag_gemm<3>(s, reps)};
+    LOG("GPU%d диагностика GEMM, TH/s: полный %.1f | без загрузок %.1f | +без барьеров %.1f | +без ldmatrix %.1f\n",
+        g->id, mac1 / t[0] / 1e9, mac1 / t[1] / 1e9, mac1 / t[2] / 1e9, mac1 / t[3] / 1e9);
+    if (!ck(cudaDeviceSynchronize(), g, "diag")) return;
+  }
   g->state = 1;
   const double mac = (double)o.m * o.n * pearl::K;
   auto t0 = std::chrono::steady_clock::now();
