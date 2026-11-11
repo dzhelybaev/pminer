@@ -61,6 +61,8 @@ struct Lane {
 struct Miner {
   Gpu *g = nullptr;
   int m = 0, n = 0, smem = 0, bm = 128, wn = 64, tw = 16, lanes = LANES;  // tw — ширина тайла = wn/4
+  bool pin = false;  // v0.18: B' закреплена в L2 (persisting access policy), если GPU умеет
+  size_t pinned = 0;  // сколько байт L2 отдано под закрепление
   bool pipe = true;  // v0.15: конвейер фрагментов через границу стадий (только блок 128, тайл 8×16)
   const int k = pearl::K, r = pearl::R;
   static const int LANES = 2, MAX_HITS = 64, BATCH = 64;  // BATCH — максимум слотов пакета
@@ -79,7 +81,7 @@ struct Miner {
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
-  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true) {
+  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true, bool pin_ = false) {
     m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4; pipe = pipe_ && bm == 128 && wn == 64;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
@@ -97,6 +99,22 @@ struct Miner {
     }
     CK(cudaMalloc(&dB, (size_t)n * k));
     CK(cudaMalloc(&dBp, (size_t)n * k));
+    pin = false;
+    pinned = 0;
+    if (pin_ && p.persistingL2CacheMaxSize > 0 && p.accessPolicyMaxWindowSize > 0) {
+      // B' неизменна всю задачу: закрепляем её в L2, чтобы поток A' её не вытеснял
+      size_t bytes = std::min((size_t)n * k, (size_t)p.accessPolicyMaxWindowSize);
+      pinned = std::min(bytes, (size_t)p.persistingL2CacheMaxSize);
+      CK(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, pinned));
+      cudaStreamAttrValue a = {};
+      a.accessPolicyWindow.base_ptr = dBp;
+      a.accessPolicyWindow.num_bytes = bytes;
+      a.accessPolicyWindow.hitRatio = std::min(1.0f, (float)pinned / (float)bytes);
+      a.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
+      a.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
+      for (int i = 0; i < lanes; i++) CK(cudaStreamSetAttribute(ln[i].st, cudaStreamAttributeAccessPolicyWindow, &a));
+      pin = true;
+    }
     CK(cudaMalloc(&dE, (size_t)n * r));
     CK(cudaMalloc(&dCount, BATCH * sizeof(unsigned)));
     CK(cudaMalloc(&dHits, BATCH * MAX_HITS * sizeof(kern::Hit)));
@@ -106,6 +124,11 @@ struct Miner {
     return true;
   }
   void release() {
+    if (pin) {  // вернуть L2 в общее пользование
+      cudaCtxResetPersistingL2Cache();
+      cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0);
+      pin = false;
+    }
     for (auto &l : ln) {
       if (l.dAp) cudaFree(l.dAp);
       if (l.dF) cudaFree(l.dF);
@@ -360,7 +383,7 @@ static void microbench(Gpu *g) {
   cudaFree(d);
 }
 
-struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1;  // 0 — автонастройка
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1, pin = 1;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
 
@@ -376,16 +399,19 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
-  struct Cand { int bm, m, n, lanes, wn; bool pipe; };
+  struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; };
   std::vector<Cand> cands;
   // («n под волну» из v0.9 ни разу не выиграл — убран из перебора)
   // {блок, m, n, полосы, ширина warp, конвейер}. Тайл 8×8 (v0.13) везде проигрывал — только --tile 8
-  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0});
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0});
   else if (big_l2)
-    cands = {{128, 512, 4096, 2, 64, true}, {128, 1024, 4096, 2, 64, true}, {128, 2048, 2048, 1, 64, true},
-             {128, 512, 4096, 2, 64, false}, {128, 1024, 4096, 2, 64, false}};
+    cands = {{128, 512, 4096, 2, 64, true, true}, {128, 1024, 4096, 2, 64, true, true},
+             {128, 512, 4096, 2, 64, false, true}, {128, 1024, 4096, 2, 64, false, true},
+             {128, 512, 4096, 2, 64, true, false}, {128, 1024, 4096, 2, 64, true, false},
+             {128, 512, 4096, 2, 64, false, false}, {128, 2048, 2048, 1, 64, true, true}};
   else
-    cands = {{128, 8192, 16384, 2, 64, true}, {128, 8192, 16384, 2, 64, false}, {128, 4096, 8192, 2, 64, true}};
+    cands = {{128, 8192, 16384, 2, 64, false, false}, {128, 8192, 16384, 2, 64, true, false},
+             {128, 4096, 8192, 2, 64, false, false}};
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
@@ -399,7 +425,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   double best_hs = -1;
   int best_bs = 8;
   for (const Cand &c : cands) {
-    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe, c.pin) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
     int bs = 8;
     auto tw = std::chrono::steady_clock::now();
@@ -418,18 +444,18 @@ static void worker(Gpu *g, Opts o, int ngpu) {
       sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
-    LOG("GPU%d тест: блок %d тайл 8×%d%s m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
-        mn.pipe ? " конвейер" : "", c.m, c.n, c.lanes, bs, hs / 1e12);
+    LOG("GPU%d тест: блок %d тайл 8×%d%s%s m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
+        mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", c.m, c.n, c.lanes, bs, hs / 1e12);
     if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
-  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe) || !mn.job(hdr)) {
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe, best.pin) || !mn.job(hdr)) {
     g->state = -1;
     return;
   }
-  LOG("GPU%d выбрано: блок %d тайл 8×%d%s m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
-      mn.pipe ? " конвейер" : "", best.m, best.n, best.lanes,
+  LOG("GPU%d выбрано: блок %d тайл 8×%d%s%s m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
+      mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", best.m, best.n, best.lanes,
       best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
   if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
@@ -511,6 +537,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--nbits") && i + 1 < argc) o.nbits = strtoul(argv[++i], nullptr, 16);
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nopipe")) o.pipe = 0;
+    else if (!strcmp(argv[i], "--nopin")) o.pin = 0;
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tile") && i + 1 < argc) o.wn = atoi(argv[++i]) * 4;  // 16 или 8
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
@@ -550,8 +577,9 @@ int main(int argc, char **argv) {
     gpus[i].bus = p.pciBusID;
     gpus[i].name = p.name;
     snprintf(gpus[i].busid, sizeof gpus[i].busid, "%02x:%02x.0", p.pciBusID, p.pciDeviceID);
-    printf("GPU%d %s sm_%d%d SM=%d L2=%d МБ bus %s\n", i, p.name, p.major, p.minor, p.multiProcessorCount,
-           p.l2CacheSize >> 20, gpus[i].busid);
+    printf("GPU%d %s sm_%d%d SM=%d L2=%d МБ (закрепить можно %d МБ, окно %d МБ) bus %s\n", i, p.name, p.major,
+           p.minor, p.multiProcessorCount, p.l2CacheSize >> 20, (int)(p.persistingL2CacheMaxSize >> 20),
+           p.accessPolicyMaxWindowSize >> 20, gpus[i].busid);
   }
   fflush(stdout);
   std::vector<std::thread> th;
