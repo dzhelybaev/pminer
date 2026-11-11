@@ -1,4 +1,4 @@
-"""Ожидаемые значения самотеста pminer (m=n=128, k=4096, r=128, тайл 8×16 в регистрах потока).
+"""Ожидаемые значения самотеста pminer (m=256, n=128, k=4096, r=128, тайл 8×16 в регистрах потока).
 Должно совпадать с selftest() в src/pminer.cu. Вывод вставляется в src/selftest.h."""
 import sys
 from pathlib import Path
@@ -10,7 +10,7 @@ import pearlhash_ref as R  # noqa: E402
 
 M64 = (1 << 64) - 1
 SEED_A, SEED_B, SEED_N = 0xA11CE, 0xB0B, 0x5EED
-M = N = 128
+M, N = 256, 128
 K, RANK = 4096, 128
 NBITS = 0x1E100000
 

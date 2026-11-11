@@ -85,13 +85,13 @@ inline void bound(uint32_t nbits, uint32_t out[8]) {
 }
 
 // детерминированный ГПСЧ для матриц: значения [-64, 64]
-inline uint64_t splitmix(uint64_t z) {
+__host__ __device__ inline uint64_t splitmix(uint64_t z) {
   z += 0x9e3779b97f4a7c15ull;
   z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ull;
   z = (z ^ (z >> 27)) * 0x94d049bb133111ebull;
   return z ^ (z >> 31);
 }
-inline int8_t rnd_val(uint64_t seed, uint64_t i) { return (int8_t)((int)(splitmix(seed + i) % 129) - 64); }
+__host__ __device__ inline int8_t rnd_val(uint64_t seed, uint64_t i) { return (int8_t)((int)(splitmix(seed + i) % 129) - 64); }
 
 // дешёвый генератор базовых матриц (host и GPU одинаково): murmur3 fmix32 + сужение до [-64,64]
 __host__ __device__ __forceinline__ int8_t gen_val(uint32_t seed, uint32_t idx) {
