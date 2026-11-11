@@ -54,13 +54,16 @@ static kern::Seed to_seed(const uint8_t b[32]) {
 // попытки чередуются по полосам, GEMM одной перекрывается с шумом и хвостом другой.
 struct Lane {
   cudaStream_t st = nullptr;
-  int8_t *dAp = nullptr;
+  static const int MAXPER = 4;
+  int8_t *dAp[MAXPER] = {};  // A' для попыток одного запуска GEMM
   uint8_t *dF = nullptr, *dS = nullptr;
 };
 
 struct Miner {
   Gpu *g = nullptr;
   int m = 0, n = 0, smem = 0, bm = 128, wn = 64, tw = 16, lanes = LANES;  // tw — ширина тайла = wn/4
+  int per = 1;  // попыток на один запуск GEMM (общая сетка: меньше хвостов и пауз между запусками)
+  kern::AttDesc *dAtt = nullptr, *hAtt = nullptr;  // описания попыток: на GPU и pinned
   const int k = pearl::K, r = pearl::R;
   static const int LANES = 2, MAX_HITS = 64, BATCH = 64;  // BATCH — максимум слотов пакета
   Lane ln[LANES];
@@ -78,8 +81,8 @@ struct Miner {
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
-  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64) {
-    m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4;
+  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, int per_ = 1) {
+    m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4; per = per_;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
     smem = kern::gemm_smem(bm, p.major);
@@ -88,7 +91,7 @@ struct Miner {
     else CK(cudaFuncSetAttribute(kern::k_gemm<128, 64>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     for (int i = 0; i < lanes; i++) {
       CK(cudaStreamCreateWithFlags(&ln[i].st, cudaStreamNonBlocking));
-      CK(cudaMalloc(&ln[i].dAp, (size_t)m * k));
+      for (int j = 0; j < per; j++) CK(cudaMalloc(&ln[i].dAp[j], (size_t)m * k));
       CK(cudaMalloc(&ln[i].dF, k));
       CK(cudaMalloc(&ln[i].dS, k));
     }
@@ -98,13 +101,15 @@ struct Miner {
     CK(cudaMalloc(&dCount, BATCH * sizeof(unsigned)));
     CK(cudaMalloc(&dHits, BATCH * MAX_HITS * sizeof(kern::Hit)));
     CK(cudaMallocHost(&hCount, BATCH * sizeof(unsigned)));
+    CK(cudaMalloc(&dAtt, BATCH * sizeof(kern::AttDesc)));
+    CK(cudaMallocHost(&hAtt, BATCH * sizeof(kern::AttDesc)));
     CK(cudaMalloc(&dDigest, 32));
     CK(cudaEventCreateWithFlags(&done, cudaEventBlockingSync | cudaEventDisableTiming));
     return true;
   }
   void release() {
     for (auto &l : ln) {
-      if (l.dAp) cudaFree(l.dAp);
+      for (auto *p : l.dAp) if (p) cudaFree(p);
       if (l.dF) cudaFree(l.dF);
       if (l.dS) cudaFree(l.dS);
       if (l.st) cudaStreamDestroy(l.st);
@@ -114,6 +119,9 @@ struct Miner {
     void *p[] = {dB, dBp, dE, dCount, dHits, dDigest};
     for (void *q : p) if (q) cudaFree(q);
     if (hCount) cudaFreeHost(hCount);
+    if (dAtt) cudaFree(dAtt);
+    if (hAtt) cudaFreeHost(hAtt);
+    dAtt = hAtt = nullptr;
     if (done) cudaEventDestroy(done);
     done = nullptr;
     dB = dBp = dE = nullptr; dCount = hCount = nullptr; dHits = nullptr; dDigest = nullptr;
@@ -158,19 +166,20 @@ struct Miner {
   }
 
   // шум A на полосе: перестановка (+ сброс счётчика) и слитое ядро A'
-  void noise_a(Lane &l, const kern::Seed &s, uint64_t nonce, unsigned *reset) {
+  void noise_a(Lane &l, int buf, const kern::Seed &s, uint64_t nonce, unsigned *reset) {
     kern::k_perm<<<((k + 7) / 8 + 127) / 128, 128, 0, l.st>>>(l.dF, l.dS, k, r, s, true, reset);
-    kern::k_apply_fused<<<m, 256, r, l.st>>>(l.dAp, (uint32_t)seedA, seedN, nonce, s, l.dF, l.dS, k, r, dense);
+    kern::k_apply_fused<<<m, 256, r, l.st>>>(l.dAp[buf], (uint32_t)seedA, seedN, nonce, s, l.dF, l.dS, k, r, dense);
   }
-  void gemm(Lane &l, const kern::Seed &s, unsigned *cnt, kern::Hit *hits, int maxh, uint32_t *dig) {
-    int blocks = (m / bm) * (n / kern::BN);
+  // один запуск GEMM по natt попыткам с описаниями att (на GPU)
+  void gemm(Lane &l, const kern::AttDesc *att, int natt, int maxh, uint32_t *dig) {
+    int blocks = (m / bm) * (n / kern::BN) * natt;
     int thr = kern::gemm_threads_rt(bm, wn);
     if (bm == 256)
-      kern::k_gemm<256, 64><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+      kern::k_gemm<256, 64><<<blocks, thr, smem, l.st>>>(att, dBp, m, n, k, r, bnd, maxh, dig);
     else if (wn == 32)
-      kern::k_gemm<128, 32><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+      kern::k_gemm<128, 32><<<blocks, thr, smem, l.st>>>(att, dBp, m, n, k, r, bnd, maxh, dig);
     else
-      kern::k_gemm<128, 64><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+      kern::k_gemm<128, 64><<<blocks, thr, smem, l.st>>>(att, dBp, m, n, k, r, bnd, maxh, dig);
   }
 
   // диагностика: время одного GEMM (мс) в режиме MODE на полосе 0, только блок 128
@@ -179,12 +188,14 @@ struct Miner {
     const int thr = kern::gemm_threads_rt(128, WN);
     Lane &l = ln[0];
     int blocks = (m / 128) * (n / kern::BN);
+    hAtt[0] = {l.dAp[0], s, dCount, dHits};
+    cudaMemcpyAsync(dAtt, hAtt, sizeof(kern::AttDesc), cudaMemcpyHostToDevice, l.st);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
-    kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+    kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(dAtt, dBp, m, n, k, r, bnd, 0, nullptr);
     cudaEventRecord(e0, l.st);
     for (int i = 0; i < reps; i++)
-      kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+      kern::k_gemm<128, WN, MODE><<<blocks, thr, smem, l.st>>>(dAtt, dBp, m, n, k, r, bnd, 0, nullptr);
     cudaEventRecord(e1, l.st);
     cudaEventSynchronize(e1);
     float ms = 0;
@@ -193,18 +204,24 @@ struct Miner {
     return ms / reps;
   }
 
-  // постановка попытки в поток полосы (без синхронизации); slot — место в пакете
-  bool enqueue(uint64_t nonce, int slot, bool with_digest) {
-    int8_t c0[1024];
-    pearl::chunk0(seedN, nonce, c0, dense);  // на GPU тот же чанк считается в k_apply_fused
-    uint8_t ha[32], aseed[32];
-    treeA.root_with_chunk0((const uint8_t *)c0, ha);
-    pearl::seed_a(bseed, ha, m, aseed, salted);
-    Lane &l = ln[slot % lanes];
-    kern::Seed s = to_seed(aseed);
+  // группа из c попыток (слоты slot0..slot0+c-1) в поток полосы: шум каждой в свой буфер A',
+  // затем один запуск GEMM на всю группу. Без синхронизации
+  bool enqueue(Lane &l, uint64_t nonce0, uint64_t step, int slot0, int c, bool with_digest) {
     if (with_digest) CK(cudaMemsetAsync(dDigest, 0, 32, l.st));
-    noise_a(l, s, nonce, dCount + slot);
-    gemm(l, s, dCount + slot, dHits + slot * MAX_HITS, MAX_HITS, with_digest ? dDigest : nullptr);
+    for (int i = 0; i < c; i++) {
+      const uint64_t nonce = nonce0 + i * step;
+      const int slot = slot0 + i;
+      int8_t c0[1024];
+      pearl::chunk0(seedN, nonce, c0, dense);  // на GPU тот же чанк считается в k_apply_fused
+      uint8_t ha[32], aseed[32];
+      treeA.root_with_chunk0((const uint8_t *)c0, ha);
+      pearl::seed_a(bseed, ha, m, aseed, salted);
+      kern::Seed s = to_seed(aseed);
+      noise_a(l, i, s, nonce, dCount + slot);
+      hAtt[slot] = {l.dAp[i], s, dCount + slot, dHits + slot * MAX_HITS};
+    }
+    CK(cudaMemcpyAsync(dAtt + slot0, hAtt + slot0, c * sizeof(kern::AttDesc), cudaMemcpyHostToDevice, l.st));
+    gemm(l, dAtt + slot0, c, MAX_HITS, with_digest ? dDigest : nullptr);
     CK(cudaGetLastError());
     return true;
   }
@@ -212,8 +229,11 @@ struct Miner {
   // пакет из cnt попыток; возвращает сумму удач. on_hit(nonce, row0, col0) — для каждой удачи
   template <class F>
   bool batch(uint64_t nonce0, uint64_t step, int cnt, unsigned &hits, F &&on_hit) {
-    for (int s = 0; s < cnt; s++)
-      if (!enqueue(nonce0 + s * step, s, false)) return false;
+    for (int s = 0, gi = 0; s < cnt; gi++) {  // группы по per попыток, полосы по очереди
+      int c = std::min(per, cnt - s);
+      if (!enqueue(ln[gi % lanes], nonce0 + s * step, step, s, c, false)) return false;
+      s += c;
+    }
     for (int i = 1; i < lanes; i++) {  // событие в полосе 0 ждёт остальные полосы
       CK(cudaEventRecord(done, ln[i].st));
       CK(cudaStreamWaitEvent(ln[0].st, done, 0));
@@ -270,7 +290,7 @@ static bool selftest(Gpu *g, int bm, int wn) {
   const int vi = wn == 32 ? 1 : 0;  // набор ожидаемых значений
   unsigned hits = 0;
   uint32_t dig[8] = {0};
-  ok = ok && mn.enqueue(0, 0, true) && ck(cudaDeviceSynchronize(), g, "sync") && ck(cudaMemcpy(&hits, mn.dCount, 4, cudaMemcpyDeviceToHost), g, "hits") &&
+  ok = ok && mn.enqueue(mn.ln[0], 0, 1, 0, 1, true) && ck(cudaDeviceSynchronize(), g, "sync") && ck(cudaMemcpy(&hits, mn.dCount, 4, cudaMemcpyDeviceToHost), g, "hits") &&
        ck(cudaMemcpy(dig, mn.dDigest, 32, cudaMemcpyDeviceToHost), g, "digest");
   // координаты первой удачи с GPU → доказательство официальным кодом Pearl → проверка
   int proof_ok = -1;
@@ -298,7 +318,7 @@ static bool selftest(Gpu *g, int bm, int wn) {
   return pass;
 }
 
-struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0;  // 0 — автонастройка
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, per = 0;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
 
@@ -310,7 +330,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
-  struct Cand { int bm, m, n, lanes, wn; };
+  struct Cand { int bm, m, n, lanes, wn, per; };
   std::vector<Cand> cands;
   // n, при котором число блоков (m/128)·(n/128) кратно числу мест (2 блока на SM) —
   // последняя волна блоков заполнена целиком; ближайшее к target
@@ -321,14 +341,15 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     int c0 = slots / g0, q = (target / 128 + c0 / 2) / c0;
     return 128 * c0 * (q < 1 ? 1 : q);
   };
-  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64});
+  // {блок, m, n, полосы, ширина warp, попыток на запуск}. L2-карты: lanes·per·A' + B' ≤ ~20 МБ
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.per ? o.per : 1});
   else if (big_l2)
-    cands = {{128, 512, 4096, 2, 64}, {128, 1024, 4096, 2, 64}, {128, 2048, 2048, 1, 64},
-             {128, 512, 4096, 2, 32}, {128, 1024, 4096, 2, 32}, {128, 2048, 2048, 1, 32},
-             {128, 1024, aligned_n(1024, 2048), 2, 32}};
+    cands = {{128, 512, 4096, 2, 64, 1}, {128, 1024, 4096, 2, 64, 1}, {128, 2048, 2048, 1, 64, 1},
+             {128, 512, 4096, 1, 64, 2}, {128, 512, 2048, 2, 64, 2}, {128, 512, 2048, 1, 64, 4},
+             {128, 1024, 2048, 1, 64, 2}, {128, 256, 4096, 1, 64, 4}, {128, 1024, aligned_n(1024, 2048), 1, 64, 2}};
   else
-    cands = {{128, 8192, 16384, 2, 64}, {128, 4096, 8192, 2, 64}, {128, 8192, 16384, 2, 32},
-             {128, 4096, 8192, 2, 32}};
+    cands = {{128, 8192, 16384, 2, 64, 1}, {128, 8192, 16384, 1, 64, 2}, {128, 4096, 8192, 2, 64, 2}};
+  // тайл 8×8 (v0.13) везде проигрывал — только вручную (--tile 8)
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
@@ -342,7 +363,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   double best_hs = -1;
   int best_bs = 8;
   for (const Cand &c : cands) {
-    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.per) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
     int bs = 8;
     auto tw = std::chrono::steady_clock::now();
@@ -361,21 +382,24 @@ static void worker(Gpu *g, Opts o, int ngpu) {
       sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
-    LOG("GPU%d тест: блок %d тайл 8×%d m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4, c.m, c.n,
-        c.lanes, bs, hs / 1e12);
+    LOG("GPU%d тест: блок %d тайл 8×%d m=%d n=%d полос %d по %d в запуске, пакет %d → %.2f TH/s\n", g->id, c.bm,
+        c.wn / 4, c.m, c.n, c.lanes, c.per, bs, hs / 1e12);
     if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
-  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn) || !mn.job(hdr)) { g->state = -1; return; }
-  LOG("GPU%d выбрано: блок %d тайл 8×%d m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4, best.m,
-      best.n, best.lanes,
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.per) || !mn.job(hdr)) {
+    g->state = -1;
+    return;
+  }
+  LOG("GPU%d выбрано: блок %d тайл 8×%d m=%d n=%d полос %d по %d в запуске, пакет %d (L2 %d МБ)\n", g->id, best.bm,
+      best.wn / 4, best.m, best.n, best.lanes, best.per,
       best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
   if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
     uint8_t sd[32] = {1};
     kern::Seed s = to_seed(sd);
-    mn.noise_a(mn.ln[0], s, 1, nullptr);
+    mn.noise_a(mn.ln[0], 0, s, 1, nullptr);
     const int reps = (double)o.m * o.n > 2e7 ? 5 : 50;
     double mac1 = (double)o.m * o.n * pearl::K;
     float t[4];
@@ -447,6 +471,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--n") && i + 1 < argc) o.n = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nbits") && i + 1 < argc) o.nbits = strtoul(argv[++i], nullptr, 16);
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--per") && i + 1 < argc) o.per = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tile") && i + 1 < argc) o.wn = atoi(argv[++i]) * 4;  // 16 или 8
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
@@ -456,7 +481,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--pass") && i + 1 < argc) pass = argv[++i];
   }
   if (o.m % 256 || o.n % 128 || (o.bm && o.bm != 128 && o.bm != 256) || (o.wn && o.wn != 64 && o.wn != 32) ||
-      (o.wn == 32 && o.bm == 256) || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || o.m < 0 || o.n < 0) {
+      (o.wn == 32 && o.bm == 256) || o.per < 0 || o.per > Lane::MAXPER || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || o.m < 0 || o.n < 0) {
     fprintf(stderr, "pminer: --m (≥256) — степень двойки, --n — кратно 128; --bm 128|256; --tile 16|8 (8 — только с --bm 128); --lanes 1|2\n");
     return 1;
   }
