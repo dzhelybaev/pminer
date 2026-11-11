@@ -13,6 +13,10 @@
 - `hiveos/` — h-manifest.conf, h-config.sh, h-run.sh, h-stats.sh
 - `build.sh` — сборка бинарника и пакета `dist/pminer-<ver>.tar.gz`
 - `dist/` — готовый пакет для HiveOS (коммитится, ссылка raw)
+- `ref/pearlhash_ref.py` — эталон pearlhash на numpy (dense, сертификат V3 salted)
+- `ref/test_ref.py` + `ref/vectors.json` — сверка эталона с векторами из Rust-кода Pearl
+- `ref/gen_vectors.patch` — патч к pearl-research-labs/pearl@0dbdb2f (zk-pow/src/ffi/mine.rs),
+  генерация векторов: `cargo test --release --lib pminer_dump_vectors` → /tmp/pearl_vectors.json
 
 ## Сборка
 CUDA 12.8+ на Ubuntu 20.04 (glibc 2.31 — совместимость с HiveOS):
@@ -36,8 +40,18 @@ Flight Sheet → Miner: Custom → Setup:
 - pminer v0.1 не подключается к пулу: любые сообщения пула не от него
 - Репозиторий публичный: нужен для скачивания пакета HiveOS по raw-ссылке
 
+## Алгоритм pearlhash (проверено эталоном)
+- job_key = blake3(header 76 Б | config 52 Б); config задаёт k, r, rows/cols pattern (тайл h×w)
+- A (m×k), B^T (n×k) — int8 в [-64,64], майнер выбирает их сам (случайные)
+- V3: сиды шума из keyed-blake3 хэшей A и B^T, «посоленных» размерами m, n
+- шум низкого ранга r=128: значения [-63,63], A+шум и B+шум помещаются в int8 → обычный IMMA
+- на каждые r элементов k: XOR всех int32-аккумуляторов тайла, jackpot[t%16]=rotl13(..)^xor
+- rotl распределяется над XOR → каждый поток копит свой jackpot[16], в конце XOR-редукция по warp
+- удача: blake3_keyed(a_seed, jackpot) как LE-число <= target(nbits)·h·w·k
+- значит хэшрейт = MAC/s, а blake3 почти ничего не стоит — всё решает скорость GEMM
+
 ## Бэклог
-1. Эталон pearlhash на Python по pearl-research-labs/pearl (noise_gen_reference, blake3, jackpot)
+1. ~~Эталон pearlhash на Python~~ — готов, совпадает с Rust-кодом Pearl
 2. CUDA: генерация шума, NoisyGEMM на mma.sync + ldmatrix/cp.async, jackpot, проверка таргета
 3. Stratum-клиент пула, доказательства через zk-pow (Rust)
 4. Тюнинг под каждую архитектуру (Nsight Compute)

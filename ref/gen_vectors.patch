@@ -1,0 +1,74 @@
+diff --git a/zk-pow/src/ffi/mine.rs b/zk-pow/src/ffi/mine.rs
+index 10a2af7..88bb53a 100644
+--- a/zk-pow/src/ffi/mine.rs
++++ b/zk-pow/src/ffi/mine.rs
+@@ -642,4 +642,69 @@ mod tests {
+         assert_eq!(b_mine, b_verify, "b_noise_seed must match between miner and verifier");
+         assert_eq!(a_mine, a_verify, "a_noise_seed must match between miner and verifier");
+     }
++
++    // ==== pminer: генерация эталонных векторов ====
++    #[test]
++    fn pminer_dump_vectors() {
++        use rand::SeedableRng;
++        use serde_json::json;
++        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
++        let mut out = vec![];
++        let cases: [(usize, usize, usize, u16, &[u32], &[u32], u32); 2] = [
++            (32, 32, 2048, 128, &[0, 1, 2, 3, 4, 5, 6, 7], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], 0x1e200000),
++            (128, 16, 2304, 128, &[0, 8, 64, 72], &[0, 1, 8, 9], 0x2000013b),
++        ];
++        for (ci, &(m, n, k, rank, rp, cp, nbits)) in cases.iter().enumerate() {
++            let mut rng = rand_chacha::ChaCha8Rng::seed_from_u64(42 + ci as u64);
++            let header = IncompleteBlockHeader {
++                version: 1, prev_block: std::array::from_fn(|i| i as u8), merkle_root: std::array::from_fn(|i| 0x80 + i as u8),
++                timestamp: 0x6a000000 + ci as u32, nbits,
++            };
++            let config = MiningConfiguration {
++                common_dim: k as u32, rank, mma_type: MMAType::Int7xInt7ToInt32,
++                rows_pattern: PeriodicPattern::from_list(rp).unwrap(),
++                cols_pattern: PeriodicPattern::from_list(cp).unwrap(), moe: None,
++            };
++            let a: Vec<Vec<i8>> = (0..m).map(|_| (0..k).map(|_| rng.random_range(-64i8..=64)).collect()).collect();
++            let bt: Vec<Vec<i8>> = (0..n).map(|_| (0..k).map(|_| rng.random_range(-64i8..=64)).collect()).collect();
++            let job_key = compute_job_key(&header, &config);
++            let (bs, as_, _) = compute_commitment_hash_with_offsets(&job_key,
++                &pearl_blake3::pad_to_chunk_boundary(&flatten_matrix(&a)),
++                &pearl_blake3::pad_to_chunk_boundary(&flatten_matrix(&bt)), None, SeedDerivation::Salted, m as u32, n as u32);
++            let noise = compute_noise_for_indices(k, rank as usize, (bs, as_), &(0..m).collect::<Vec<_>>(), &(0..n).collect::<Vec<_>>());
++            let r = rank as usize;
++            let bound = extract_difficulty_bound(nbits, &config);
++            let mut tiles = vec![];
++            for rows in threads_partition(&config.rows_pattern, m) {
++                for cols in threads_partition(&config.cols_pattern, n) {
++                    let mut acc = vec![vec![0i32; cols.len()]; rows.len()];
++                    let mut jp = [0u32; 16];
++                    for ll in (r..=k).step_by(r) {
++                        for (u, &ai) in rows.iter().enumerate() { for (v, &bi) in cols.iter().enumerate() {
++                            for l in ll - r..ll {
++                                acc[u][v] += (a[ai][l] as i32 + noise.a[ai][l] as i32) * (bt[bi][l] as i32 + noise.b[bi][l] as i32);
++                            }
++                        }}
++                        let x = acc.iter().flatten().fold(0u32, |s, &v| s ^ v as u32);
++                        let t = (ll / r - 1) % JACKPOT_SIZE;
++                        jp[t] = jp[t].rotate_left(LROT_PER_TILE) ^ x;
++                    }
++                    let h = compute_jackpot_hash(&jp, as_);
++                    tiles.push(json!({"row0": rows[0], "col0": cols[0], "jackpot": jp.to_vec(), "hash": hex(&h),
++                        "hit": U256::from_little_endian(&h) <= bound}));
++                }
++            }
++            let mut bb = [0u8; 32]; bound.to_little_endian(&mut bb);
++            out.push(json!({
++                "m": m, "n": n, "k": k, "rank": rank, "rows_pattern": rp, "cols_pattern": cp, "nbits": nbits,
++                "header": hex(&header.to_bytes()), "config": hex(&config.to_bytes()),
++                "a": hex(&flatten_matrix(&a)), "bt": hex(&flatten_matrix(&bt)),
++                "job_key": hex(&job_key), "b_noise_seed": hex(&bs), "a_noise_seed": hex(&as_),
++                "noise_a": hex(&noise.a.iter().flatten().map(|&x| x as u8).collect::<Vec<_>>()),
++                "noise_bt": hex(&noise.b.iter().flatten().map(|&x| x as u8).collect::<Vec<_>>()),
++                "bound_le": hex(&bb), "tiles": tiles,
++            }));
++        }
++        std::fs::write("/tmp/pearl_vectors.json", serde_json::to_string(&out).unwrap()).unwrap();
++    }
+ }
