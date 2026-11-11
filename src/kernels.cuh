@@ -67,9 +67,13 @@ __global__ void k_perm(uint8_t *first, uint8_t *second, int k, int r, Seed key, 
 // (32 × 16 Б = 512 Б) читает 4 целые строки кэша вместо 8 половинок — вдвое меньше запросов к L1/TEX.
 // Базовые A и B (для доказательств) остаются построчными на хосте.
 static constexpr int PANEL = 64;
+// v0.24: внутри строки панели 16-байтные сегменты уже переставлены так же, как в smem
+// (seg ^ ((row >> 1) & 3), см. sw): стадия копируется в smem как есть — потоками (cp.async /
+// регистры) или одной массовой копией TMA (cp.async.bulk) — и ldmatrix читает её без конфликтов.
 // индекс char4 номер q строки row (row уже учтён в базе dst + row·PANEL) при rows строках
-__device__ __forceinline__ size_t panel_q(int q, int rows) {
-  return (size_t)(q / (PANEL / 4)) * rows * (PANEL / 4) + (q % (PANEL / 4));
+__device__ __forceinline__ size_t panel_q(int q, int rows, int row) {
+  const int c = q % (PANEL / 4), seg = (c >> 2) ^ ((row >> 1) & 3);
+  return (size_t)(q / (PANEL / 4)) * rows * (PANEL / 4) + seg * 4 + (c & 3);
 }
 
 // dst[i][l] = src[i][l] + E[i][first[l]] - E[i][second[l]]; блок на строку
@@ -90,7 +94,7 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
     o.y = (int8_t)(a.y + e_row[f.y] - e_row[g.y]);
     o.z = (int8_t)(a.z + e_row[f.z] - e_row[g.z]);
     o.w = (int8_t)(a.w + e_row[f.w] - e_row[g.w]);
-    d4[panel_q(q, gridDim.x)] = o;
+    d4[panel_q(q, gridDim.x, (int)row)] = o;
   }
 }
 
@@ -131,7 +135,7 @@ __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint6
     o.y = (int8_t)(a[1] + e_row[f.y] - e_row[g.y]);
     o.z = (int8_t)(a[2] + e_row[f.z] - e_row[g.z]);
     o.w = (int8_t)(a[3] + e_row[f.w] - e_row[g.w]);
-    d4[panel_q(q, gridDim.x)] = o;
+    d4[panel_q(q, gridDim.x, (int)row)] = o;
   }
 }
 
@@ -159,6 +163,37 @@ __device__ __forceinline__ void cp_commit() {
   asm volatile("cp.async.commit_group;\n");
 #endif
 }
+// TMA (sm_90+, на нашем риге — RTX 5060 sm_120): массовая копия global → smem одним потоком,
+// завершение — по mbarrier (ожидаемое число байт). На старых архитектурах не вызывается.
+__device__ __forceinline__ void mbar_init(uint32_t bar) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(bar) : "memory");
+#endif
+}
+__device__ __forceinline__ void tma_load(uint32_t dst, const void *src, uint32_t bytes, uint32_t bar) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+               ::"r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+#endif
+}
+__device__ __forceinline__ void mbar_expect(uint32_t bar, uint32_t bytes) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(bar), "r"(bytes) : "memory");
+#endif
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+               "mbarrier.try_wait.parity.shared::cta.b64 P1, [%0], %1;\n\t"
+               "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}\n" ::"r"(bar), "r"(parity) : "memory");
+#endif
+}
+__device__ __forceinline__ void fence_async_smem() {
+#if __CUDA_ARCH__ >= 900
+  asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#endif
+}
+
 template <int N> __device__ __forceinline__ void cp_wait() {
 #if __CUDA_ARCH__ >= 800
   asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
@@ -297,7 +332,8 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, uint32_t 
 // WN — ширина куска warp: 64 (тайл jackpot 8×16, 128 аккумуляторов на поток) или
 // 32 (тайл 8×8, 64 аккумулятора, вдвое больше warp на SM). Кусок warp — 64×WN.
 // PIPE — конвейер фрагментов через границу стадий (v0.15); false — прежний цикл (v0.7–v0.13)
-template <int BM, int WN = 64, int MODE = 0, bool PIPE = true>
+// TMA (v0.24) — стадии грузит один поток массовыми копиями TMA с mbarrier (только sm_90+ и MODE 0)
+template <int BM, int WN = 64, int MODE = 0, bool PIPE = true, bool TMA = false>
 __global__ void __launch_bounds__(32 * (BM / 64) * (BN / WN), BM == 128 ? 2 : 1)
 k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int gm,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
@@ -312,7 +348,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int nbm = m / BM, nbn = n / BN, gsz = gm * nbn, pid = blockIdx.x;
   const int first = (pid / gsz) * gm, gs = min(nbm - first, gm), loc = pid % gsz;
   const int bm = first + loc % gs, bn = loc / gs;
-  const int lrow = t >> 2, lseg = t & 3, loff = sw(lrow, lseg);  // сегмент загрузки потока
+  // сегмент загрузки потока: копия линейная — swizzle уже в глобальной раскладке (v0.24)
+  const int lrow = t >> 2, lseg = t & 3, loff = lrow * BK + lseg * 16;
   // панельная раскладка: стадия s блока — непрерывный кусок BM×64 по адресу s·(m·64) + bm·BM·64
   static_assert(PANEL == BK, "панель = шаг k");
   const size_t pA = (size_t)m * BK, pB = (size_t)n * BK;  // байт на панель
@@ -332,10 +369,46 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 
   constexpr int KT = k / BK, per_chunk = r / BK;
   static_assert(k % BK == 0 && r % BK == 0 && KT >= STAGES, "k, r кратны BK");
+#if __CUDA_ARCH__ >= 900
+  constexpr bool use_tma = TMA && MODE == 0;
+#else
+  constexpr bool use_tma = false;
+#endif
+  __shared__ __align__(8) uint64_t mbar[STAGES];
+  const uint32_t bar0 = smem_u32(mbar);
+  const int8_t *tA = A + (size_t)bm * BM * BK, *tB = Bt + (size_t)bn * BN * BK;  // начало стадии блока
+  // загрузить стадию номер kidx в буфер buf
+  auto stage_load = [&](int buf, int kidx) {
+    if constexpr (use_tma) {
+      if (t == 0) {
+        fence_async_smem();  // буфер только что читали ldmatrix (обычный доступ) — порядок с TMA
+        mbar_expect(bar0 + 8 * buf, (BM + BN) * BK);
+        tma_load(sA(buf), tA + kidx * pA, BM * BK, bar0 + 8 * buf);
+        tma_load(sB(buf), tB + kidx * pB, BN * BK, bar0 + 8 * buf);
+      }
+    } else {
+      load_tile<BM, NTHR>(sA(buf) + loff, gA + kidx * pA);
+      load_tile<BN, NTHR>(sB(buf) + loff, gB + kidx * pB);
+    }
+  };
+  auto stage_commit = [&]() { if constexpr (!use_tma) cp_commit(); };
+  // дождаться стадии kidx (в буфере buf); после — __syncthreads у вызывающего
+  auto stage_wait = [&](int buf, int kidx) {
+    if constexpr (use_tma) mbar_wait(bar0 + 8 * buf, (kidx / STAGES) & 1);
+    else cp_wait<STAGES - 2>();
+  };
+  if constexpr (use_tma) {
+    if (t == 0) {
+#pragma unroll
+      for (int s = 0; s < STAGES; s++) mbar_init(bar0 + 8 * s);
+      asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+    }
+    __syncthreads();
+  }
 #pragma unroll
   for (int s = 0; s < STAGES - 1; s++) {
-    if (s < KT) { load_tile<BM, NTHR>(sA(s) + loff, gA + s * pA); load_tile<BN, NTHR>(sB(s) + loff, gB + s * pB); }
-    cp_commit();
+    if (s < KT) stage_load(s, s);
+    stage_commit();
   }
 
   // адреса ldmatrix: A — строка (lane%8)+8*((lane/8)%2), сегмент lane/16;
@@ -363,7 +436,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   };
   auto mmas = [&](int b) { mma_all<NJ>(acc, af[b], bf[b]); };
 
-  cp_wait<STAGES - 2>();
+  stage_wait(0, 0);
   __syncthreads();  // стадия 0 готова
   ldfr(0, 0, 0);
   if constexpr (MODE >= 3) ldfr(1, 0, 1);
@@ -375,8 +448,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
     if constexpr (MODE < 3) ldfr(1, st, 1);
 #if __CUDA_ARCH__ >= 800
     if constexpr (MODE < 1)
-      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * pA); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * pB); }
-    cp_commit();
+      if (nk < KT) stage_load(ns, nk);
+    stage_commit();
     mmas(0);
 #else
     constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
@@ -389,7 +462,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 #endif
     if (kt + 1 < KT) {
       if constexpr (MODE < 2) {
-        cp_wait<STAGES - 2>();
+        stage_wait(st1, kt + 1);
         __syncthreads();  // стадия kt+1 готова; стадию kt все уже прочитали в ldfr выше
       }
       if constexpr (MODE < 3) ldfr(0, st1, 0);
@@ -433,14 +506,14 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   int st = 0;
   for (int kt = 0; kt < KT; kt++) {
     if constexpr (MODE < 2) {
-      cp_wait<STAGES - 2>();
+      stage_wait(st, kt);
       __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
     }
     const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
 #if __CUDA_ARCH__ >= 800
     if constexpr (MODE < 1)
-      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * pA); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * pB); }
-    cp_commit();
+      if (nk < KT) stage_load(ns, nk);
+    stage_commit();
 #else
     constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
     [[maybe_unused]] RegStage<SA, SB> rg;
