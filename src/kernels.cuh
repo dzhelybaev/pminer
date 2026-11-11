@@ -61,6 +61,17 @@ __global__ void k_perm(uint8_t *first, uint8_t *second, int k, int r, Seed key, 
   }
 }
 
+// Панельная раскладка A' и B' (v0.21): k режется на панели по PANEL = 64 байта (= BK), панель
+// хранит все строки подряд: элемент (row, col) лежит в (col/64)·rows·64 + row·64 + col%64.
+// Тогда стадия GEMM (BM строк × 64 байта) — один непрерывный кусок, и каждая загрузка warp
+// (32 × 16 Б = 512 Б) читает 4 целые строки кэша вместо 8 половинок — вдвое меньше запросов к L1/TEX.
+// Базовые A и B (для доказательств) остаются построчными на хосте.
+static constexpr int PANEL = 64;
+// индекс char4 номер q строки row (row уже учтён в базе dst + row·PANEL) при rows строках
+__device__ __forceinline__ size_t panel_q(int q, int rows) {
+  return (size_t)(q / (PANEL / 4)) * rows * (PANEL / 4) + (q % (PANEL / 4));
+}
+
 // dst[i][l] = src[i][l] + E[i][first[l]] - E[i][second[l]]; блок на строку
 __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const uint8_t *first,
                         const uint8_t *second, int k, int r) {
@@ -69,7 +80,7 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
   for (int c = threadIdx.x; c < r; c += blockDim.x) e_row[c] = E[row * r + c];
   __syncthreads();
   const char4 *s4 = (const char4 *)(src + row * k);
-  char4 *d4 = (char4 *)(dst + row * k);
+  char4 *d4 = (char4 *)(dst + row * PANEL);  // панельная раскладка (v0.21), см. panel_at
   const uchar4 *f4 = (const uchar4 *)first, *g4 = (const uchar4 *)second;
   for (int q = threadIdx.x; q < k / 4; q += blockDim.x) {
     char4 a = s4[q];
@@ -79,7 +90,7 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
     o.y = (int8_t)(a.y + e_row[f.y] - e_row[g.y]);
     o.z = (int8_t)(a.z + e_row[f.z] - e_row[g.z]);
     o.w = (int8_t)(a.w + e_row[f.w] - e_row[g.w]);
-    d4[q] = o;
+    d4[panel_q(q, gridDim.x)] = o;
   }
 }
 
@@ -102,7 +113,7 @@ __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint6
     }
   }
   __syncthreads();
-  char4 *d4 = (char4 *)(dst + row * k);
+  char4 *d4 = (char4 *)(dst + row * PANEL);  // панельная раскладка (v0.21)
   const uchar4 *f4 = (const uchar4 *)first, *g4 = (const uchar4 *)second;
   for (int q = threadIdx.x; q < k / 4; q += blockDim.x) {
     uint32_t idx = (uint32_t)(row * k) + 4 * q;
@@ -120,7 +131,7 @@ __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint6
     o.y = (int8_t)(a[1] + e_row[f.y] - e_row[g.y]);
     o.z = (int8_t)(a[2] + e_row[f.z] - e_row[g.z]);
     o.w = (int8_t)(a[3] + e_row[f.w] - e_row[g.w]);
-    d4[q] = o;
+    d4[panel_q(q, gridDim.x)] = o;
   }
 }
 
@@ -172,6 +183,31 @@ __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, uint32_t b0,
   asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
                : "+r"(c[2]), "+r"(c[3]) : "r"(a[3]), "r"(b1));
 #endif
+}
+
+// Turing: половина m16n8k32 — шаг k16 (h = 0: a[0], a[1] × b0; h = 1: a[2], a[3] × b1).
+// Цикл по фрагментам делает сначала все h = 0, потом все h = 1: зависимые IMMA одного аккумулятора
+// разнесены на десятки инструкций (профиль v0.20: простой «fixed latency dependency» 31%).
+__device__ __forceinline__ void mma_half(int *c, const uint32_t *a, uint32_t b0, uint32_t b1, int h) {
+#if __CUDA_ARCH__ < 800
+  const uint32_t bb = h ? b1 : b0;
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+      : "+r"(c[0]), "+r"(c[1]) : "r"(a[h ? 2 : 0]), "r"(bb));
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+      : "+r"(c[2]), "+r"(c[3]) : "r"(a[h ? 3 : 1]), "r"(bb));
+#else
+  if (h == 0) mma16832(c, a, b0, b1);
+#endif
+}
+// все фрагменты warp: acc[4][NJ] += af[4] × bf[NJ]
+template <int NJ>
+__device__ __forceinline__ void mma_all(int (*acc)[NJ][4], const uint32_t (*af)[4], const uint32_t (*bf)[2]) {
+#pragma unroll
+  for (int h = 0; h < 2; h++)
+#pragma unroll
+    for (int i = 0; i < 4; i++)
+#pragma unroll
+      for (int j = 0; j < NJ; j++) mma_half(acc[i][j], af[i], bf[j][0], bf[j][1], h);
 }
 
 // Микробенчмарк тензорных ядер: 4 warp в блоке, 8 независимых цепочек mma на warp, данные в
@@ -230,7 +266,7 @@ template <int ROWS, int NTHR>
 __device__ __forceinline__ void load_tile(uint32_t s, const int8_t *g) {
   constexpr int RS = NTHR / 4;
 #pragma unroll
-  for (int i = 0; i < ROWS / RS; i++) cp16u(s + i * RS * BK, g + (size_t)i * RS * pearl::K);
+  for (int i = 0; i < ROWS / RS; i++) cp16u(s + i * RS * BK, g + i * RS * PANEL);
 }
 
 // Turing: следующая стадия грузится в регистры до вычислений и кладётся в smem после
@@ -239,9 +275,9 @@ template <int NTHR, int SA, int SB>
 __device__ __forceinline__ void load_regs(RegStage<SA, SB> &rg, const int8_t *gA, const int8_t *gB) {
   constexpr int RS = NTHR / 4;
 #pragma unroll
-  for (int i = 0; i < SA; i++) rg.a[i] = *(const uint4 *)(gA + (size_t)i * RS * pearl::K);
+  for (int i = 0; i < SA; i++) rg.a[i] = *(const uint4 *)(gA + i * RS * PANEL);
 #pragma unroll
-  for (int i = 0; i < SB; i++) rg.b[i] = *(const uint4 *)(gB + (size_t)i * RS * pearl::K);
+  for (int i = 0; i < SB; i++) rg.b[i] = *(const uint4 *)(gB + i * RS * PANEL);
 }
 template <int NTHR, int SA, int SB>
 __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, uint32_t sA, uint32_t sB) {
@@ -277,8 +313,11 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int first = (pid / gsz) * gm, gs = min(nbm - first, gm), loc = pid % gsz;
   const int bm = first + loc % gs, bn = loc / gs;
   const int lrow = t >> 2, lseg = t & 3, loff = sw(lrow, lseg);  // сегмент загрузки потока
-  const int8_t *gA = A + ((size_t)bm * BM + lrow) * k + lseg * 16;
-  const int8_t *gB = Bt + ((size_t)bn * BN + lrow) * k + lseg * 16;
+  // панельная раскладка: стадия s блока — непрерывный кусок BM×64 по адресу s·(m·64) + bm·BM·64
+  static_assert(PANEL == BK, "панель = шаг k");
+  const size_t pA = (size_t)m * BK, pB = (size_t)n * BK;  // байт на панель
+  const int8_t *gA = A + ((size_t)bm * BM + lrow) * BK + lseg * 16;
+  const int8_t *gB = Bt + ((size_t)bn * BN + lrow) * BK + lseg * 16;
 
   int acc[4][NJ][4];
 #pragma unroll
@@ -295,7 +334,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   static_assert(k % BK == 0 && r % BK == 0 && KT >= STAGES, "k, r кратны BK");
 #pragma unroll
   for (int s = 0; s < STAGES - 1; s++) {
-    if (s < KT) { load_tile<BM, NTHR>(sA(s) + loff, gA + s * BK); load_tile<BN, NTHR>(sB(s) + loff, gB + s * BK); }
+    if (s < KT) { load_tile<BM, NTHR>(sA(s) + loff, gA + s * pA); load_tile<BN, NTHR>(sB(s) + loff, gB + s * pB); }
     cp_commit();
   }
 
@@ -322,12 +361,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
       ldsm4u(bf[b][2 * j][0], bf[b][2 * j][1], bf[b][2 * j + 1][0], bf[b][2 * j + 1][1],
              sB(st) + boff[ks] + 16 * j * BK);
   };
-  auto mmas = [&](int b) {
-#pragma unroll
-    for (int i = 0; i < 4; i++)
-#pragma unroll
-      for (int j = 0; j < NJ; j++) mma16832(acc[i][j], af[b][i], bf[b][j][0], bf[b][j][1]);
-  };
+  auto mmas = [&](int b) { mma_all<NJ>(acc, af[b], bf[b]); };
 
   cp_wait<STAGES - 2>();
   __syncthreads();  // стадия 0 готова
@@ -341,14 +375,14 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
     if constexpr (MODE < 3) ldfr(1, st, 1);
 #if __CUDA_ARCH__ >= 800
     if constexpr (MODE < 1)
-      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * BK); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * BK); }
+      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * pA); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * pB); }
     cp_commit();
     mmas(0);
 #else
     constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
     [[maybe_unused]] RegStage<SA, SB> rg;
     if constexpr (MODE < 1)
-      if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK);
+      if (nk < KT) load_regs<NTHR>(rg, gA + nk * pA, gB + nk * pB);
     mmas(0);
     if constexpr (MODE < 1)
       if (nk < KT) store_regs<NTHR>(rg, sA(ns) + loff, sB(ns) + loff);
@@ -405,22 +439,18 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
     const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
 #if __CUDA_ARCH__ >= 800
     if constexpr (MODE < 1)
-      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * BK); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * BK); }
+      if (nk < KT) { load_tile<BM, NTHR>(sA(ns) + loff, gA + nk * pA); load_tile<BN, NTHR>(sB(ns) + loff, gB + nk * pB); }
     cp_commit();
 #else
     constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
     [[maybe_unused]] RegStage<SA, SB> rg;
     if constexpr (MODE < 1)
-      if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK);
+      if (nk < KT) load_regs<NTHR>(rg, gA + nk * pA, gB + nk * pB);
 #endif
     {  // два шага k32: сначала все ldmatrix обоих шагов, потом все mma
       if constexpr (MODE < 3) load_frags(st);
 #pragma unroll
-      for (int ks = 0; ks < 2; ks++)
-#pragma unroll
-        for (int i = 0; i < 4; i++)
-#pragma unroll
-          for (int j = 0; j < NJ; j++) mma16832(acc[i][j], af[ks][i], bf[ks][j][0], bf[ks][j][1]);
+      for (int ks = 0; ks < 2; ks++) mma_all<NJ>(acc, af[ks], bf[ks]);
     }
     if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
       uint32_t xp[4];  // XOR деревом: 4 независимые цепочки вместо одной длинной
