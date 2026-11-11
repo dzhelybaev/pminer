@@ -58,7 +58,7 @@ struct Lane {
 
 struct Miner {
   Gpu *g = nullptr;
-  int m = 0, n = 0, smem = 0;
+  int m = 0, n = 0, smem = 0, bm = 128, lanes = LANES;
   const int k = pearl::K, r = pearl::R;
   static const int LANES = 2, MAX_HITS = 64, BATCH = 8;
   Lane ln[LANES];
@@ -72,12 +72,13 @@ struct Miner {
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
-  bool alloc(int m_, int n_, int lanes = LANES) {
-    m = m_; n = n_;
+  bool alloc(int m_, int n_, int lanes_, int bm_) {
+    m = m_; n = n_; lanes = lanes_; bm = bm_;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
-    smem = (p.major >= 8 ? 3 : 2) * (kern::BM + kern::BN) * kern::BK;  // = STAGES ядра
-    CK(cudaFuncSetAttribute(kern::k_gemm, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    smem = kern::gemm_smem(bm, p.major);
+    if (bm == 128) CK(cudaFuncSetAttribute(kern::k_gemm<128>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
+    else CK(cudaFuncSetAttribute(kern::k_gemm<256>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
     for (int i = 0; i < lanes; i++) {
       CK(cudaStreamCreateWithFlags(&ln[i].st, cudaStreamNonBlocking));
       CK(cudaMalloc(&ln[i].dAp, (size_t)m * k));
@@ -99,10 +100,12 @@ struct Miner {
       if (l.dF) cudaFree(l.dF);
       if (l.dS) cudaFree(l.dS);
       if (l.st) cudaStreamDestroy(l.st);
+      l = Lane();
     }
     void *p[] = {dB, dBp, dE, dCount, dHits, dDigest};
     for (void *q : p) if (q) cudaFree(q);
     if (hCount) cudaFreeHost(hCount);
+    dB = dBp = dE = nullptr; dCount = hCount = nullptr; dHits = nullptr; dDigest = nullptr;
   }
 
   // новая задача: заголовок, матрицы A и B^T, дерево A, шум B
@@ -136,8 +139,11 @@ struct Miner {
     kern::k_apply_fused<<<m, 256, r, l.st>>>(l.dAp, (uint32_t)seedA, seedN, nonce, s, l.dF, l.dS, k, r);
   }
   void gemm(Lane &l, const kern::Seed &s, unsigned *cnt, kern::Hit *hits, int maxh, uint32_t *dig) {
-    int blocks = (m / kern::BM) * (n / kern::BN);
-    kern::k_gemm<<<blocks, kern::NTHR, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+    int blocks = (m / bm) * (n / kern::BN);
+    if (bm == 128)
+      kern::k_gemm<128><<<blocks, 128, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
+    else
+      kern::k_gemm<256><<<blocks, 256, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig);
   }
 
   // постановка попытки в поток полосы (без синхронизации); slot — место в пакете
@@ -147,7 +153,7 @@ struct Miner {
     uint8_t ha[32], aseed[32];
     treeA.root_with_chunk0((const uint8_t *)c0, ha);
     pearl::seed_a(bseed, ha, m, aseed);
-    Lane &l = ln[slot % LANES];
+    Lane &l = ln[slot % lanes];
     kern::Seed s = to_seed(aseed);
     if (with_digest) CK(cudaMemsetAsync(dDigest, 0, 32, l.st));
     noise_a(l, s, nonce, dCount + slot);
@@ -179,10 +185,10 @@ static pearl::Header test_header(uint32_t nbits, uint64_t salt) {
   return h;
 }
 
-static bool selftest(Gpu *g) {
+static bool selftest(Gpu *g, int bm) {
   Miner mn;
   mn.g = g;
-  bool ok = mn.alloc(256, 128, 1) && mn.job(test_header(0x1e100000, 0));
+  bool ok = mn.alloc(256, 128, 1, bm) && mn.job(test_header(0x1e100000, 0));
   unsigned hits = 0;
   uint32_t dig[8] = {0};
   ok = ok && mn.enqueue(0, 0, true) && ck(cudaDeviceSynchronize(), g, "sync") && ck(cudaMemcpy(&hits, mn.dCount, 4, cudaMemcpyDeviceToHost), g, "hits") &&
@@ -190,54 +196,65 @@ static bool selftest(Gpu *g) {
   mn.release();
   if (!ok) return false;
   bool pass = hits == SELFTEST_HITS && !memcmp(dig, SELFTEST_DIGEST, 32);
-  LOG("GPU%d selftest %s (hits %u/%u, digest %08x.. ожид. %08x..)\n", g->id, pass ? "OK" : "FAIL", hits,
+  LOG("GPU%d selftest блок %d: %s (hits %u/%u, digest %08x.. ожид. %08x..)\n", g->id, bm, pass ? "OK" : "FAIL", hits,
       SELFTEST_HITS, dig[0], SELFTEST_DIGEST[0]);
   return pass;
 }
 
-struct Opts { int m = 0, n = 0;  // 0 — авто по размеру L2
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false; };
 
 static void worker(Gpu *g, Opts o, int ngpu) {
   if (!ck(cudaSetDevice(g->id), g, "cudaSetDevice")) return;
-  if (!selftest(g)) { g->state = -1; return; }
+  if (!selftest(g, 128) || !selftest(g, 256)) { g->state = -1; return; }
   if (o.selftest_only) { g->state = 2; return; }
   cudaDeviceProp p;
   cudaGetDeviceProperties(&p, g->id);
-  // L2-карты: две полосы A' по 4 МБ + B' 8 МБ = 16 МБ в L2
-  if (!o.m) o.m = p.l2CacheSize >= (20 << 20) ? 1024 : 8192;
-  if (!o.n) o.n = p.l2CacheSize >= (20 << 20) ? 2048 : 16384;
+  const bool big_l2 = p.l2CacheSize >= (20 << 20);
+  // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
+  struct Cand { int bm, m, n, lanes; };
+  std::vector<Cand> cands;
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes});
+  else if (big_l2)
+    cands = {{128, 2048, 2048, 1}, {128, 1024, 2048, 2}, {128, 2048, 1024, 2}, {256, 2048, 2048, 1},
+             {256, 1024, 2048, 2}, {128, 1024, 4096, 2}};
+  else
+    cands = {{128, 8192, 16384, 1}, {128, 8192, 16384, 2}, {256, 8192, 16384, 1}, {128, 4096, 16384, 2}};
   Miner mn;
   mn.g = g;
   mn.seedA = SEED_A + 0x1000000ull * g->id;
   mn.seedB = SEED_B + 0x1000000ull * g->id;
-  auto t_job = std::chrono::steady_clock::now();
-  if (!mn.alloc(o.m, o.n) || !mn.job(test_header(o.nbits, 0x1234 + g->id))) { g->state = -1; return; }
-  LOG("GPU%d задача готова за %.1f с (m=%d n=%d k=%d, L2 %d МБ)\n", g->id,
-      std::chrono::duration<double>(std::chrono::steady_clock::now() - t_job).count(), o.m, o.n, pearl::K,
-      p.l2CacheSize >> 20);
-  {  // замер фаз на одной полосе: GEMM отдельно и шум A отдельно
-    cudaEvent_t e0, e1;
-    cudaEventCreate(&e0); cudaEventCreate(&e1);
-    uint8_t sd[32] = {1};
-    kern::Seed s = to_seed(sd);
-    const int N = 20;
-    float tg = 0, tn = 0;
-    Lane &l = mn.ln[0];
-    mn.noise_a(l, s, 1, nullptr);
-    cudaEventRecord(e0, l.st);
-    for (int i = 0; i < N; i++) mn.gemm(l, s, mn.dCount, mn.dHits, 0, nullptr);
-    cudaEventRecord(e1, l.st); cudaEventSynchronize(e1); cudaEventElapsedTime(&tg, e0, e1);
-    cudaEventRecord(e0, l.st);
-    for (int i = 0; i < N; i++) mn.noise_a(l, s, i, nullptr);
-    cudaEventRecord(e1, l.st); cudaEventSynchronize(e1); cudaEventElapsedTime(&tn, e0, e1);
-    double mac1 = (double)o.m * o.n * pearl::K;
-    LOG("GPU%d замер: GEMM %.3f мс (%.2f TH/s), шум A %.3f мс\n", g->id, tg / N, mac1 / (tg / N * 1e-3) / 1e12, tn / N);
-    cudaEventDestroy(e0); cudaEventDestroy(e1);
+  const pearl::Header hdr = test_header(o.nbits, 0x1234 + g->id);
+  uint64_t nonce = 1 + g->id;
+  // автонастройка: ~1 с майнинга на каждом кандидате, берём лучший
+  Cand best = cands[0];
+  double best_hs = -1;
+  for (const Cand &c : cands) {
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    unsigned h = 0;
+    mn.batch(nonce, ngpu, Miner::BATCH, h);  // прогрев
+    nonce += (uint64_t)ngpu * Miner::BATCH;
+    int it = 0;
+    auto t0 = std::chrono::steady_clock::now();
+    double sec = 0;
+    bool ok = true;
+    while (sec < 1.0 && (ok = mn.batch(nonce, ngpu, Miner::BATCH, h))) {
+      nonce += (uint64_t)ngpu * Miner::BATCH;
+      it += Miner::BATCH;
+      sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    }
+    double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
+    LOG("GPU%d тест: блок %d m=%d n=%d полос %d → %.2f TH/s\n", g->id, c.bm, c.m, c.n, c.lanes, hs / 1e12);
+    if (hs > best_hs) { best_hs = hs; best = c; }
+    mn.release();
+    g->state = 0;
   }
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm) || !mn.job(hdr)) { g->state = -1; return; }
+  LOG("GPU%d выбрано: блок %d m=%d n=%d полос %d (L2 %d МБ)\n", g->id, best.bm, best.m, best.n, best.lanes,
+      p.l2CacheSize >> 20);
+  o.m = best.m; o.n = best.n;
   g->state = 1;
   const double mac = (double)o.m * o.n * pearl::K;
-  uint64_t nonce = 1 + g->id;
   auto t0 = std::chrono::steady_clock::now();
   int it = 0;
   while (true) {
@@ -267,10 +284,12 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--m") && i + 1 < argc) o.m = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--n") && i + 1 < argc) o.n = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nbits") && i + 1 < argc) o.nbits = strtoul(argv[++i], nullptr, 16);
+    else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
   }
-  if (o.m % 256 || o.n % 128 || (o.m & (o.m - 1)) || (o.n & (o.n - 1)) || o.m < 0 || o.n < 0) {
-    fprintf(stderr, "pminer: --m (≥256) и --n (≥128) должны быть степенями двойки\n");
+  if (o.m % 256 || o.n % 128 || (o.bm && o.bm != 128 && o.bm != 256) || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || (o.n & (o.n - 1)) || o.m < 0 || o.n < 0) {
+    fprintf(stderr, "pminer: --m (≥256), --n (≥128) — степени двойки; --bm 128|256; --lanes 1|2\n");
     return 1;
   }
   printf("pminer %s: pearlhash dense V3, k=%d r=%d тайл %dx%d, nbits=%08x (тест, без пула)\n",

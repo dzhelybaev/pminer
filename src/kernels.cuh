@@ -124,16 +124,17 @@ __global__ void k_apply_fused(int8_t *dst, uint32_t seedA, uint64_t seedN, uint6
 }
 
 // ---------------- NoisyGEMM ----------------
-// Блок 128×128, 4 warp по 64×64, шаг K 64 байта, 2 стадии smem.
+// Блок BM×128 (BM = 128 или 256), warp по 64×64 ((BM/64)×2 warp), шаг K 64 байта.
 // Поток warp держит 4×8 фрагментов m16n8 = 128 аккумуляторов = ровно один тайл
 // rows {g+8a}, cols {2(l%4)+8b+{0,1}} — шаблоны ROWS/COLS_PATTERN из pearl.h.
-static constexpr int BM = 256, BN = 128, BK = 64, NTHR = 256, GROUP_M = 4;
+static constexpr int BN = 128, BK = 64;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
-static constexpr int STAGES = 2;  // Turing: синхронные загрузки
+static constexpr int STAGES = 2;  // Turing: загрузки через регистры
 #else
-static constexpr int STAGES = 3;  // cp.async, 3×24 КБ = 72 КБ dynamic smem
+static constexpr int STAGES = 3;  // cp.async
 #endif
-
+// размер dynamic smem на хосте (STAGES зависит от архитектуры)
+inline int gemm_smem(int bm, int major) { return (major >= 8 ? 3 : 2) * (bm + BN) * BK; }
 struct Hit { uint32_t row0, col0; };
 
 __device__ __forceinline__ uint32_t smem_u32(const void *p) {
@@ -185,8 +186,8 @@ __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, uint32_t b0,
 // смещение 16-байтного сегмента в строке 64 байта со swizzle (без конфликтов банков)
 __device__ __forceinline__ int sw(int row, int seg) { return row * BK + 16 * (seg ^ ((row >> 1) & 3)); }
 
-// загрузка тайла ROWS×64 байт: ROWS*4 сегментов по 16 байт
-template <int ROWS>
+// загрузка тайла ROWS×64 байт: ROWS*4 сегментов по 16 байт, NTHR потоков
+template <int ROWS, int NTHR>
 __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int k, int t) {
 #pragma unroll
   for (int i = 0; i < ROWS * 4 / NTHR; i++) {
@@ -196,28 +197,29 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int k, int
 }
 
 // Turing: следующая стадия грузится в регистры до вычислений и кладётся в smem после
-static constexpr int SEG_A = BM * 4 / NTHR, SEG_B = BN * 4 / NTHR;
-struct RegStage { uint4 a[SEG_A], b[SEG_B]; };
-__device__ __forceinline__ void load_regs(RegStage &rg, const int8_t *gA, const int8_t *gB, int k, int t) {
+template <int SA, int SB> struct RegStage { uint4 a[SA], b[SB]; };
+template <int NTHR, int SA, int SB>
+__device__ __forceinline__ void load_regs(RegStage<SA, SB> &rg, const int8_t *gA, const int8_t *gB, int k, int t) {
 #pragma unroll
-  for (int i = 0; i < SEG_A; i++) {
+  for (int i = 0; i < SA; i++) {
     int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
     rg.a[i] = *(const uint4 *)(gA + (size_t)row * k + seg * 16);
   }
 #pragma unroll
-  for (int i = 0; i < SEG_B; i++) {
+  for (int i = 0; i < SB; i++) {
     int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
     rg.b[i] = *(const uint4 *)(gB + (size_t)row * k + seg * 16);
   }
 }
-__device__ __forceinline__ void store_regs(const RegStage &rg, int8_t *sA, int8_t *sB, int t) {
+template <int NTHR, int SA, int SB>
+__device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, int8_t *sA, int8_t *sB, int t) {
 #pragma unroll
-  for (int i = 0; i < SEG_A; i++) {
+  for (int i = 0; i < SA; i++) {
     int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
     *(uint4 *)(sA + sw(row, seg)) = rg.a[i];
   }
 #pragma unroll
-  for (int i = 0; i < SEG_B; i++) {
+  for (int i = 0; i < SB; i++) {
     int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
     *(uint4 *)(sB + sw(row, seg)) = rg.b[i];
   }
@@ -226,9 +228,11 @@ __device__ __forceinline__ void store_regs(const RegStage &rg, int8_t *sA, int8_
 // A' (m×k), B'^T (n×k): int8, k-непрерывные. k кратно BK, r кратно BK.
 // Сетка одномерная, порядок блоков сгруппирован по GROUP_M строк блоков —
 // одновременно работающие блоки делят панели A и B в L2.
-__global__ void __launch_bounds__(NTHR, 1)
+template <int BM>
+__global__ void __launch_bounds__(BM, BM == 128 ? 2 : 1)
 k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int k, int r,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
+  constexpr int NTHR = BM, GROUP_M = 1024 / BM;
   extern __shared__ __align__(128) int8_t smem[];  // STAGES × (A BM×BK | B BN×BK)
   int8_t(*sA)[BM * BK] = (int8_t(*)[BM * BK])smem;
   int8_t(*sB)[BN * BK] = (int8_t(*)[BN * BK])(smem + STAGES * BM * BK);
@@ -254,7 +258,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   const int KT = k / BK, per_chunk = r / BK;
 #pragma unroll
   for (int s = 0; s < STAGES - 1; s++) {
-    if (s < KT) { load_tile<BM>(sA[s], gA + s * BK, k, t); load_tile<BN>(sB[s], gB + s * BK, k, t); }
+    if (s < KT) { load_tile<BM, NTHR>(sA[s], gA + s * BK, k, t); load_tile<BN, NTHR>(sB[s], gB + s * BK, k, t); }
     cp_commit();
   }
 
@@ -269,11 +273,12 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
     __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
     const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
 #if __CUDA_ARCH__ >= 800
-    if (nk < KT) { load_tile<BM>(sA[ns], gA + nk * BK, k, t); load_tile<BN>(sB[ns], gB + nk * BK, k, t); }
+    if (nk < KT) { load_tile<BM, NTHR>(sA[ns], gA + nk * BK, k, t); load_tile<BN, NTHR>(sB[ns], gB + nk * BK, k, t); }
     cp_commit();
 #else
-    RegStage rg;
-    if (nk < KT) load_regs(rg, gA + nk * BK, gB + nk * BK, k, t);
+    constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
+    RegStage<SA, SB> rg;
+    if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
 #endif
 #pragma unroll
     for (int ks = 0; ks < 2; ks++) {  // два шага k32 в стадии
@@ -304,7 +309,7 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
       jp[15] = nv;
     }
 #if __CUDA_ARCH__ < 800
-    if (nk < KT) store_regs(rg, sA[ns], sB[ns], t);
+    if (nk < KT) store_regs<NTHR>(rg, sA[ns], sB[ns], t);
 #endif
     st = st == STAGES - 1 ? 0 : st + 1;
   }
