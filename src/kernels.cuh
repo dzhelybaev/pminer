@@ -581,4 +581,121 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   }
 }
 
+// ---------------- v0.25: k_gemm3 — 3 блока на SM (12 warp) ----------------
+// Тот же блок 128×128, warp 64×64, тайл jackpot 8×16 и та же раскладка A'/B', но:
+// - __launch_bounds__(128, 3): не больше ~168 регистров на поток (128 аккумуляторов + 16 jackpot
+//   + фрагменты); фрагменты B грузятся по два столбца j прямо перед своими mma, а не все сразу;
+// - 2 стадии по BK=64 (32 КБ smem на блок): 3 блока × 33 КБ влезают в 100 КБ SM (sm_86/89/120).
+// Смысл: у основного ядра 2 warp на планировщик, и простои (ожидание ldmatrix/барьера) нечем
+// закрыть; здесь их 3. Только sm_80+ (cp.async); на Turing smem SM 64 КБ — не помещается.
+static constexpr int STAGES3 = 2;
+inline int gemm3_smem() { return STAGES3 * (128 + BN) * BK; }
+__global__ void __launch_bounds__(128, 3)
+k_gemm3(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int gm,
+        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
+#if __CUDA_ARCH__ >= 800
+  constexpr int BM = 128, NTHR = 128, k = pearl::K, r = pearl::R, KT = k / BK, per_chunk = r / BK;
+  extern __shared__ __align__(128) int8_t smem[];
+  const uint32_t sbase = smem_u32(smem);
+  auto sA = [&](int st) { return sbase + st * (BM * BK); };
+  auto sB = [&](int st) { return sbase + STAGES3 * BM * BK + st * (BN * BK); };
+  const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+  const int wm = (warp >> 1) * 64, wn = (warp & 1) * 64;
+  const int nbm = m / BM, nbn = n / BN, gsz = gm * nbn, pid = blockIdx.x;
+  const int first = (pid / gsz) * gm, gs = min(nbm - first, gm), loc = pid % gsz;
+  const int bm = first + loc % gs, bn = loc / gs;
+  const int loff = t * 16;  // линейная копия: swizzle уже в глобальной раскладке
+  const uint32_t pA = (uint32_t)m * BK, pB = (uint32_t)n * BK;  // байт на панель (< 4 ГБ на матрицу)
+  const int8_t *gA = A + (size_t)bm * BM * BK + loff;
+  const int8_t *gB = Bt + (size_t)bn * BN * BK + loff;
+  uint32_t oA = 0, oB = 0;  // смещение текущей панели
+
+  int acc[4][8][4];
+#pragma unroll
+  for (int i = 0; i < 4; i++)
+#pragma unroll
+    for (int j = 0; j < 8; j++)
+#pragma unroll
+      for (int c = 0; c < 4; c++) acc[i][j][c] = 0;
+  // jackpot — кольцо в локальной памяти (динамический индекс): слово t%16 обновляется раз в 2 шага
+  // k, а 16 регистров уходят на фрагменты. jackpot[t%16] = rotl13(jackpot[t%16]) ^ xor(тайл).
+  uint32_t jp[16];
+#pragma unroll
+  for (int i = 0; i < 16; i++) jp[i] = 0;
+  int ch = 0;
+
+  const int a_row = (lane & 7) + 8 * ((lane >> 3) & 1), a_seg = lane >> 4;
+  const int b_row = (lane & 7) + 8 * (lane >> 4), b_seg = (lane >> 3) & 1;
+  const int aoff[2] = {sw(wm + a_row, a_seg), sw(wm + a_row, 2 + a_seg)};
+  const int boff[2] = {sw(wn + b_row, b_seg), sw(wn + b_row, 2 + b_seg)};
+
+  load_tile<BM, NTHR>(sA(0) + loff, gA);
+  load_tile<BN, NTHR>(sB(0) + loff, gB);
+  cp_commit();
+  int st = 0;
+#pragma unroll 1
+  for (int kt = 0; kt < KT; kt++) {
+    cp_wait<0>();
+    __syncthreads();  // стадия kt готова; буфер st^1 (стадия kt-1) все дочитали
+    oA += pA; oB += pB;
+    if (kt + 1 < KT) {
+      load_tile<BM, NTHR>(sA(st ^ 1) + loff, gA + oA);
+      load_tile<BN, NTHR>(sB(st ^ 1) + loff, gB + oB);
+    }
+    cp_commit();
+#pragma unroll
+    for (int ks = 0; ks < 2; ks++) {
+      uint32_t af[4][4];
+#pragma unroll
+      for (int i = 0; i < 4; i++)
+        ldsm4u(af[i][0], af[i][1], af[i][2], af[i][3], sA(st) + aoff[ks] + 16 * i * BK);
+#pragma unroll
+      for (int jj = 0; jj < 4; jj++) {  // два столбца j = 2jj, 2jj+1
+        uint32_t b0, b1, b2, b3;
+        ldsm4u(b0, b1, b2, b3, sB(st) + boff[ks] + 16 * jj * BK);
+#pragma unroll
+        for (int i = 0; i < 4; i++) {
+          mma16832(acc[i][2 * jj], af[i], b0, b1);
+          mma16832(acc[i][2 * jj + 1], af[i], b2, b3);
+        }
+      }
+    }
+    if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
+      uint32_t xp[4];
+#pragma unroll
+      for (int c = 0; c < 4; c++) {
+        xp[c] = 0;
+#pragma unroll
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+          for (int j = 0; j < 8; j++) xp[c] ^= (uint32_t)acc[i][j][c];
+      }
+      uint32_t x = (xp[0] ^ xp[1]) ^ (xp[2] ^ xp[3]);
+      const uint32_t v = jp[ch & 15];
+      jp[ch & 15] = ((v << 13) | (v >> 19)) ^ x;
+      ch++;
+    }
+    st ^= 1;
+  }
+  uint32_t h[8];
+  b3::compress(a_seed.w, jp, 0, 64, SINGLE_KEYED, h);
+  bool le = true;
+#pragma unroll
+  for (int w = 7; w >= 0; w--) {
+    if (h[w] != bnd.w[w]) { le = h[w] < bnd.w[w]; break; }
+  }
+  if (digest) {
+#pragma unroll
+    for (int w = 0; w < 8; w++) atomicXor(&digest[w], h[w]);
+  }
+  if (le) {
+    unsigned i = atomicAdd(hit_count, 1u);
+    if ((int)i < max_hits) {
+      hits[i].row0 = bm * BM + wm + (lane >> 2);
+      hits[i].col0 = bn * BN + wn + 2 * (lane & 3);
+    }
+  }
+#endif
+}
+
 }  // namespace kern

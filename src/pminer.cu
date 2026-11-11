@@ -66,6 +66,8 @@ struct Miner {
   int m = 0, n = 0, smem = 0, bm = 128, wn = 64, tw = 16, lanes = LANES;  // tw — ширина тайла = wn/4
   bool pin = false;  // v0.18: B' закреплена в L2 (persisting access policy), если GPU умеет
   size_t pinned = 0;  // сколько байт L2 отдано под закрепление
+  bool occ3 = false;  // v0.25: ядро k_gemm3 (3 блока на SM, 2 стадии, ≤168 регистров), sm_80+
+  int occ = 0;        // сколько блоков на SM даёт CUDA для выбранного ядра
   bool tma = false;  // v0.24: стадии через TMA (sm_90+, блок 128, тайл 8×16)
   int gm = 8;  // v0.20: строк блоков в группе обхода (общие панели A/B в L2)
   bool pipe = true;  // v0.15: конвейер фрагментов через границу стадий (только блок 128, тайл 8×16)
@@ -87,15 +89,22 @@ struct Miner {
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
   bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true, bool pin_ = false, int gm_ = 0,
-             bool tma_ = false) {
+             bool tma_ = false, bool occ3_ = false) {
     gm = gm_ > 0 ? std::min(gm_, m_ / bm_) : std::max(1, std::min(1024 / bm_, m_ / bm_));
     m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4; pipe = pipe_ && bm == 128 && wn == 64;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
     smem = kern::gemm_smem(bm, p.major);
     tma = tma_ && bm == 128 && wn == 64 && p.major >= 9;
+    occ3 = occ3_ && bm == 128 && wn == 64 && p.major >= 8;
     const auto attr = cudaFuncAttributeMaxDynamicSharedMemorySize;
-    if (tma && pipe) CK(cudaFuncSetAttribute(kern::k_gemm<128, 64, 0, true, true>, attr, smem));
+    if (occ3) {
+      tma = pipe = false;
+      smem = kern::gemm3_smem();
+      CK(cudaFuncSetAttribute(kern::k_gemm3, attr, smem));
+      CK(cudaFuncSetAttribute(kern::k_gemm3, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
+      CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, kern::k_gemm3, 128, smem));
+    } else if (tma && pipe) CK(cudaFuncSetAttribute(kern::k_gemm<128, 64, 0, true, true>, attr, smem));
     else if (tma) CK(cudaFuncSetAttribute(kern::k_gemm<128, 64, 0, false, true>, attr, smem));
     else if (bm == 256) CK(cudaFuncSetAttribute(kern::k_gemm<256, 64, 0, false>, attr, smem));
     else if (wn == 32) CK(cudaFuncSetAttribute(kern::k_gemm<128, 32, 0, false>, attr, smem));
@@ -202,7 +211,8 @@ struct Miner {
     int blocks = (m / bm) * (n / kern::BN);
     int thr = kern::gemm_threads_rt(bm, wn);
 #define PM_GEMM(...) kern::k_gemm<__VA_ARGS__><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, gm, s, bnd, cnt, hits, maxh, dig)
-    if (tma && pipe) PM_GEMM(128, 64, 0, true, true);
+    if (occ3) kern::k_gemm3<<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, gm, s, bnd, cnt, hits, maxh, dig);
+    else if (tma && pipe) PM_GEMM(128, 64, 0, true, true);
     else if (tma) PM_GEMM(128, 64, 0, false, true);
     else if (bm == 256) PM_GEMM(256, 64, 0, false);
     else if (wn == 32) PM_GEMM(128, 32, 0, false);
@@ -300,11 +310,12 @@ static pearl::Header test_header(uint32_t nbits, uint64_t salt) {
   return h;
 }
 
-static bool selftest(Gpu *g, int bm, int wn, bool pipe = false, bool tma = false) {
+static bool selftest(Gpu *g, int bm, int wn, bool pipe = false, bool tma = false, bool occ3 = false) {
   Miner mn;
   mn.g = g;
   mn.dense = true;  // самотест — на случайных матрицах эталона
-  bool ok = mn.alloc(256, 128, 1, bm, wn, pipe, false, 0, tma) && mn.job(test_header(0x1e100000, 0));
+  bool ok = mn.alloc(256, 128, 1, bm, wn, pipe, false, 0, tma, occ3) && mn.job(test_header(0x1e100000, 0));
+  const int occ = mn.occ;
   const int vi = wn == 32 ? 1 : 0;  // набор ожидаемых значений
   unsigned hits = 0;
   uint32_t dig[8] = {0};
@@ -330,8 +341,10 @@ static bool selftest(Gpu *g, int bm, int wn, bool pipe = false, bool tma = false
   mn.release();
   if (!ok) return false;
   bool pass = hits == SELFTEST_HITS[vi] && !memcmp(dig, SELFTEST_DIGEST[vi], 32) && proof_ok == 1;
-  LOG("GPU%d selftest блок %d тайл 8×%d%s%s: %s (hits %u/%u, digest %08x.. ожид. %08x.., доказательство %s)\n", g->id,
-      bm, wn / 4, mn.pipe ? " конвейер" : "", tma ? " TMA" : "", pass ? "OK" : "FAIL", hits, SELFTEST_HITS[vi], dig[0], SELFTEST_DIGEST[vi][0],
+  char o3[32] = "";
+  if (occ3) snprintf(o3, sizeof o3, " 3блока(SM: %d)", occ);
+  LOG("GPU%d selftest блок %d тайл 8×%d%s%s%s: %s (hits %u/%u, digest %08x.. ожид. %08x.., доказательство %s)\n", g->id,
+      bm, wn / 4, mn.pipe ? " конвейер" : "", tma ? " TMA" : "", o3, pass ? "OK" : "FAIL", hits, SELFTEST_HITS[vi], dig[0], SELFTEST_DIGEST[vi][0],
       proof_ok == 1 ? "OK" : "FAIL");
   return pass;
 }
@@ -395,7 +408,7 @@ static void microbench(Gpu *g) {
   cudaFree(d);
 }
 
-struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1, pin = 1, gm = 0, tma = 1;  // 0 — автонастройка
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1, pin = 1, gm = 0, tma = 0, occ3 = 1;  // tma: v0.24 проиграл — только --tma  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
 
@@ -409,6 +422,11 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     cudaDeviceProp pp;
     cudaGetDeviceProperties(&pp, g->id);
     if (pp.major < 9) o.tma = 0;
+    if (pp.major < 8) o.occ3 = 0;
+    if (o.occ3 && !selftest(g, 128, 64, false, false, true)) {
+      LOG("GPU%d ядро на 3 блока не прошло самотест — без него\n", g->id);
+      o.occ3 = 0;
+    }
     if (o.tma && (!selftest(g, 128, 64, true, true) || !selftest(g, 128, 64, false, true))) {
       LOG("GPU%d TMA не прошёл самотест — без TMA\n", g->id);
       o.tma = 0;
@@ -420,11 +438,11 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
-  struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; int gm = 0; bool tma = false; };  // gm 0 — 1024/bm
+  struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; int gm = 0; bool tma = false, occ3 = false; };  // gm 0 — 1024/bm
   std::vector<Cand> cands;
   // («n под волну» в v0.9 не выиграл; в v0.22 вернулся — после устранения других тормозов)
   // {блок, m, n, полосы, ширина warp, конвейер}. Тайл 8×8 (v0.13) везде проигрывал — только --tile 8
-  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0, o.gm, o.tma != 0});
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0, o.gm, o.tma != 0, o.occ3 == 2});
   else if (big_l2)
     cands = {{128, 512, 4096, 2, 64, true, true}, {128, 1024, 4096, 2, 64, true, true},
              {128, 512, 4096, 2, 64, false, true}, {128, 1024, 4096, 2, 64, false, true},
@@ -447,6 +465,13 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     for (Cand c : std::vector<Cand>(cands))
       if (c.lanes == 2 && c.pin) { c.tma = true; cands.push_back(c); }
   }
+  if (cands.size() > 1 && o.occ3) {
+    // v0.25: ядро на 3 блока — для каждого (m, n, закреп) без TMA/конвейера, 2 полосы
+    std::vector<Cand> add;
+    for (const Cand &c : cands)
+      if (c.lanes == 2 && !c.tma && !c.pipe && c.bm == 128 && c.wn == 64) { Cand d = c; d.occ3 = true; add.push_back(d); }
+    cands.insert(cands.end(), add.begin(), add.end());
+  }
   if (!big_l2 && cands.empty())
     // v0.20: малый L2 (Turing) упирается в DRAM — перебор группы обхода gm (сколько строк блоков
     // идут рядом и делят панели B в L2)
@@ -467,7 +492,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   double best_hs = -1;
   int best_bs = 8;
   for (const Cand &c : cands) {
-    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe, c.pin, c.gm, c.tma) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe, c.pin, c.gm, c.tma, c.occ3) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
     int bs = 8;
     auto tw = std::chrono::steady_clock::now();
@@ -487,20 +512,20 @@ static void worker(Gpu *g, Opts o, int ngpu) {
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
     LOG("GPU%d тест: блок %d тайл 8×%d%s%s%s m=%d n=%d группа %d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
-        mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", mn.tma ? " TMA" : "", c.m, c.n, mn.gm, c.lanes, bs, hs / 1e12);
+        mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", mn.tma ? " TMA" : mn.occ3 ? " 3блока" : "", c.m, c.n, mn.gm, c.lanes, bs, hs / 1e12);
     if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
-  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe, best.pin, best.gm, best.tma) || !mn.job(hdr)) {
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe, best.pin, best.gm, best.tma, best.occ3) || !mn.job(hdr)) {
     g->state = -1;
     return;
   }
   LOG("GPU%d выбрано: блок %d тайл 8×%d%s%s%s m=%d n=%d группа %d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
-      mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", mn.tma ? " TMA" : "", best.m, best.n, mn.gm, best.lanes,
+      mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", mn.tma ? " TMA" : mn.occ3 ? " 3блока" : "", best.m, best.n, mn.gm, best.lanes,
       best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
-  if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
+  if (best.bm == 128 && !best.occ3) {  // диагностика узких мест GEMM на выбранных размерах
     uint8_t sd[32] = {1};
     kern::Seed s = to_seed(sd);
     mn.noise_a(mn.ln[0], s, 1, nullptr);
@@ -581,6 +606,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--nopipe")) o.pipe = 0;
     else if (!strcmp(argv[i], "--nopin")) o.pin = 0;
     else if (!strcmp(argv[i], "--notma")) o.tma = 0;
+    else if (!strcmp(argv[i], "--tma")) o.tma = 1;
+    else if (!strcmp(argv[i], "--no3")) o.occ3 = 0;
+    else if (!strcmp(argv[i], "--only3")) o.occ3 = 2;  // с --bm/--m/--n/--lanes: только ядро на 3 блока
     else if (!strcmp(argv[i], "--group") && i + 1 < argc) o.gm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tile") && i + 1 < argc) o.wn = atoi(argv[++i]) * 4;  // 16 или 8
