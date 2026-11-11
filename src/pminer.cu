@@ -63,6 +63,7 @@ struct Miner {
   int m = 0, n = 0, smem = 0, bm = 128, wn = 64, tw = 16, lanes = LANES;  // tw — ширина тайла = wn/4
   bool pin = false;  // v0.18: B' закреплена в L2 (persisting access policy), если GPU умеет
   size_t pinned = 0;  // сколько байт L2 отдано под закрепление
+  int gm = 8;  // v0.20: строк блоков в группе обхода (общие панели A/B в L2)
   bool pipe = true;  // v0.15: конвейер фрагментов через границу стадий (только блок 128, тайл 8×16)
   const int k = pearl::K, r = pearl::R;
   static const int LANES = 2, MAX_HITS = 64, BATCH = 64;  // BATCH — максимум слотов пакета
@@ -81,7 +82,8 @@ struct Miner {
   kern::Bound bnd;
   uint64_t seedA = SEED_A, seedB = SEED_B, seedN = SEED_N;
 
-  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true, bool pin_ = false) {
+  bool alloc(int m_, int n_, int lanes_, int bm_, int wn_ = 64, bool pipe_ = true, bool pin_ = false, int gm_ = 0) {
+    gm = gm_ > 0 ? std::min(gm_, m_ / bm_) : std::max(1, std::min(1024 / bm_, m_ / bm_));
     m = m_; n = n_; lanes = lanes_; bm = bm_; wn = wn_; tw = wn / 4; pipe = pipe_ && bm == 128 && wn == 64;
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, g->id));
@@ -191,7 +193,7 @@ struct Miner {
   void gemm(Lane &l, const kern::Seed &s, unsigned *cnt, kern::Hit *hits, int maxh, uint32_t *dig) {
     int blocks = (m / bm) * (n / kern::BN);
     int thr = kern::gemm_threads_rt(bm, wn);
-#define PM_GEMM(...) kern::k_gemm<__VA_ARGS__><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, cnt, hits, maxh, dig)
+#define PM_GEMM(...) kern::k_gemm<__VA_ARGS__><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, gm, s, bnd, cnt, hits, maxh, dig)
     if (bm == 256) PM_GEMM(256, 64, 0, false);
     else if (wn == 32) PM_GEMM(128, 32, 0, false);
     else if (pipe) PM_GEMM(128, 64, 0, true);
@@ -207,10 +209,10 @@ struct Miner {
     int blocks = (m / 128) * (n / kern::BN);
     cudaEvent_t e0, e1;
     cudaEventCreate(&e0); cudaEventCreate(&e1);
-    kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+    kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, gm, s, bnd, dCount, dHits, 0, nullptr);
     cudaEventRecord(e0, l.st);
     for (int i = 0; i < reps; i++)
-      kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, k, r, s, bnd, dCount, dHits, 0, nullptr);
+      kern::k_gemm<128, WN, MODE, PIPE><<<blocks, thr, smem, l.st>>>(l.dAp, dBp, m, n, gm, s, bnd, dCount, dHits, 0, nullptr);
     cudaEventRecord(e1, l.st);
     cudaEventSynchronize(e1);
     float ms = 0;
@@ -383,7 +385,7 @@ static void microbench(Gpu *g) {
   cudaFree(d);
 }
 
-struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1, pin = 1;  // 0 — автонастройка
+struct Opts { int m = 0, n = 0, lanes = 0, bm = 0, wn = 0, pipe = 1, pin = 1, gm = 0;  // 0 — автонастройка
   uint32_t nbits = 0x1c020000; bool selftest_only = false;
   bool pool = false, dense = false; };
 
@@ -399,19 +401,23 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   cudaGetDeviceProperties(&p, g->id);
   const bool big_l2 = p.l2CacheSize >= (20 << 20);
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
-  struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; };
+  struct Cand { int bm, m, n, lanes, wn; bool pipe, pin; int gm = 0; };  // gm 0 — 1024/bm
   std::vector<Cand> cands;
   // («n под волну» из v0.9 ни разу не выиграл — убран из перебора)
   // {блок, m, n, полосы, ширина warp, конвейер}. Тайл 8×8 (v0.13) везде проигрывал — только --tile 8
-  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0});
+  if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes, o.wn ? o.wn : 64, o.pipe != 0, o.pin != 0, o.gm});
   else if (big_l2)
     cands = {{128, 512, 4096, 2, 64, true, true}, {128, 1024, 4096, 2, 64, true, true},
              {128, 512, 4096, 2, 64, false, true}, {128, 1024, 4096, 2, 64, false, true},
              {128, 512, 4096, 2, 64, true, false}, {128, 1024, 4096, 2, 64, true, false},
              {128, 512, 4096, 2, 64, false, false}, {128, 2048, 2048, 1, 64, true, true}};
   else
-    cands = {{128, 8192, 16384, 2, 64, false, false}, {128, 8192, 16384, 2, 64, true, false},
-             {128, 4096, 8192, 2, 64, false, false}};
+    // v0.20: малый L2 (Turing) упирается в DRAM — перебор группы обхода gm (сколько строк блоков
+    // идут рядом и делят панели B в L2)
+    cands = {{128, 8192, 16384, 2, 64, false, false, 8}, {128, 8192, 16384, 2, 64, false, false, 2},
+             {128, 8192, 16384, 2, 64, false, false, 4}, {128, 8192, 16384, 2, 64, false, false, 16},
+             {128, 8192, 16384, 2, 64, false, false, 32}, {128, 8192, 16384, 2, 64, false, false, 64},
+             {128, 4096, 8192, 2, 64, false, false, 8}};
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
@@ -425,7 +431,7 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   double best_hs = -1;
   int best_bs = 8;
   for (const Cand &c : cands) {
-    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe, c.pin) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
+    if (!mn.alloc(c.m, c.n, c.lanes, c.bm, c.wn, c.pipe, c.pin, c.gm) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
     int bs = 8;
     auto tw = std::chrono::steady_clock::now();
@@ -444,18 +450,18 @@ static void worker(Gpu *g, Opts o, int ngpu) {
       sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
-    LOG("GPU%d тест: блок %d тайл 8×%d%s%s m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
-        mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", c.m, c.n, c.lanes, bs, hs / 1e12);
+    LOG("GPU%d тест: блок %d тайл 8×%d%s%s m=%d n=%d группа %d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.wn / 4,
+        mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", c.m, c.n, mn.gm, c.lanes, bs, hs / 1e12);
     if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
-  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe, best.pin) || !mn.job(hdr)) {
+  if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm, best.wn, best.pipe, best.pin, best.gm) || !mn.job(hdr)) {
     g->state = -1;
     return;
   }
-  LOG("GPU%d выбрано: блок %d тайл 8×%d%s%s m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
-      mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", best.m, best.n, best.lanes,
+  LOG("GPU%d выбрано: блок %d тайл 8×%d%s%s m=%d n=%d группа %d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.wn / 4,
+      mn.pipe ? " конвейер" : "", mn.pin ? " L2-закреп" : "", best.m, best.n, mn.gm, best.lanes,
       best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
   if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
@@ -538,6 +544,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--lanes") && i + 1 < argc) o.lanes = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--nopipe")) o.pipe = 0;
     else if (!strcmp(argv[i], "--nopin")) o.pin = 0;
+    else if (!strcmp(argv[i], "--group") && i + 1 < argc) o.gm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tile") && i + 1 < argc) o.wn = atoi(argv[++i]) * 4;  // 16 или 8
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;

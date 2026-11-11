@@ -253,7 +253,7 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, uint32_t 
 }
 
 // A' (m×k), B'^T (n×k): int8, k-непрерывные. k кратно BK, r кратно BK.
-// Сетка одномерная, порядок блоков сгруппирован по GROUP_M строк блоков —
+// Сетка одномерная, порядок блоков сгруппирован по gm строк блоков (v0.20 — параметр, подбирается) —
 // одновременно работающие блоки делят панели A и B в L2.
 // MODE — диагностика узких мест (0 = рабочий режим):
 // 1 — без загрузок global→smem в цикле; 2 — ещё и без барьеров; 3 — ещё и без ldmatrix
@@ -263,9 +263,9 @@ __device__ __forceinline__ void store_regs(const RegStage<SA, SB> &rg, uint32_t 
 // PIPE — конвейер фрагментов через границу стадий (v0.15); false — прежний цикл (v0.7–v0.13)
 template <int BM, int WN = 64, int MODE = 0, bool PIPE = true>
 __global__ void __launch_bounds__(32 * (BM / 64) * (BN / WN), BM == 128 ? 2 : 1)
-k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int, int,
+k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n, int gm,
        Seed a_seed, Bound bnd, unsigned *hit_count, Hit *hits, int max_hits, uint32_t *digest) {
-  constexpr int WARPS_N = BN / WN, NTHR = 32 * (BM / 64) * WARPS_N, GROUP_M = 1024 / BM, NJ = WN / 8;
+  constexpr int WARPS_N = BN / WN, NTHR = 32 * (BM / 64) * WARPS_N, NJ = WN / 8;
   constexpr int k = pearl::K, r = pearl::R;  // v0.19: константы — без деления и умножений в цикле
   extern __shared__ __align__(128) int8_t smem[];  // STAGES × A BM×BK | STAGES × B BN×BK
   const uint32_t sbase = smem_u32(smem);
@@ -273,8 +273,8 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   auto sB = [&](int st) { return sbase + STAGES * BM * BK + st * (BN * BK); };
   const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
   const int wm = (warp / WARPS_N) * 64, wn = (warp % WARPS_N) * WN;
-  const int nbm = m / BM, nbn = n / BN, gsz = GROUP_M * nbn, pid = blockIdx.x;
-  const int first = (pid / gsz) * GROUP_M, gs = min(nbm - first, GROUP_M), loc = pid % gsz;
+  const int nbm = m / BM, nbn = n / BN, gsz = gm * nbn, pid = blockIdx.x;
+  const int first = (pid / gsz) * gm, gs = min(nbm - first, gm), loc = pid % gsz;
   const int bm = first + loc % gs, bn = loc / gs;
   const int lrow = t >> 2, lseg = t & 3, loff = sw(lrow, lseg);  // сегмент загрузки потока
   const int8_t *gA = A + ((size_t)bm * BM + lrow) * k + lseg * 16;
