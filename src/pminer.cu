@@ -67,6 +67,7 @@ struct Miner {
   kern::Hit *dHits = nullptr;
   uint32_t *dDigest = nullptr;
   unsigned *hCount = nullptr;  // pinned
+  cudaEvent_t done = nullptr;  // конец пакета; BlockingSync — поток CPU спит, а не крутится
   b3::Pow2Tree treeA;
   uint8_t jk[32], bseed[32];
   kern::Bound bnd;
@@ -92,6 +93,7 @@ struct Miner {
     CK(cudaMalloc(&dHits, BATCH * MAX_HITS * sizeof(kern::Hit)));
     CK(cudaMallocHost(&hCount, BATCH * sizeof(unsigned)));
     CK(cudaMalloc(&dDigest, 32));
+    CK(cudaEventCreateWithFlags(&done, cudaEventBlockingSync | cudaEventDisableTiming));
     return true;
   }
   void release() {
@@ -105,6 +107,8 @@ struct Miner {
     void *p[] = {dB, dBp, dE, dCount, dHits, dDigest};
     for (void *q : p) if (q) cudaFree(q);
     if (hCount) cudaFreeHost(hCount);
+    if (done) cudaEventDestroy(done);
+    done = nullptr;
     dB = dBp = dE = nullptr; dCount = hCount = nullptr; dHits = nullptr; dDigest = nullptr;
   }
 
@@ -183,7 +187,12 @@ struct Miner {
   bool batch(uint64_t nonce0, uint64_t step, int cnt, unsigned &hits) {
     for (int s = 0; s < cnt; s++)
       if (!enqueue(nonce0 + s * step, s, false)) return false;
-    CK(cudaDeviceSynchronize());
+    for (int i = 1; i < lanes; i++) {  // событие в полосе 0 ждёт остальные полосы
+      CK(cudaEventRecord(done, ln[i].st));
+      CK(cudaStreamWaitEvent(ln[0].st, done, 0));
+    }
+    CK(cudaEventRecord(done, ln[0].st));
+    CK(cudaEventSynchronize(done));
     CK(cudaMemcpy(hCount, dCount, cnt * sizeof(unsigned), cudaMemcpyDeviceToHost));
     hits = 0;
     for (int s = 0; s < cnt; s++) hits += hCount[s];
@@ -242,11 +251,10 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   };
   if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes});
   else if (big_l2)
-    cands = {{128, 2048, aligned_n(2048, 2048), 1}, {128, 1024, aligned_n(1024, 2048), 2},
-             {128, 1024, aligned_n(1024, 3072), 2}, {128, 2048, 2048, 1}, {128, 1024, 4096, 2},
-             {128, 512, 4096, 2}};
+    cands = {{128, 512, 4096, 2}, {128, 1024, 4096, 2}, {128, 2048, 2048, 1},
+             {128, 1024, aligned_n(1024, 2048), 2}};
   else
-    cands = {{128, 8192, 16384, 2}, {128, 4096, 8192, 2}, {128, 8192, aligned_n(8192, 16384), 2}};
+    cands = {{128, 8192, 16384, 2}, {128, 4096, 8192, 2}};
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
