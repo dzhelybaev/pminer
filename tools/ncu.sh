@@ -26,7 +26,7 @@ miner stop >/dev/null 2>&1; sleep 3
 for g in ${@:-0 1 2}; do
   # параметры — как выбирала автонастройка (v0.19–v0.20), имя ядра — шаблон k_gemm<128,64,0,PIPE>
   case $g in
-    0) ARGS="--bm 128 --m 512 --n 4096 --lanes 2 --nopipe"; K=k_gemmILi128ELi64ELi0ELb0E ;;
+    0) ARGS="--bm 128 --m 512 --n 4096 --lanes 2 --nopipe --only3"; K=k_gemm3 ;;  # v0.25: ядро на 3 блока
     1) ARGS="--bm 128 --m 512 --n 4096 --lanes 2"; K=k_gemmILi128ELi64ELi0ELb1E ;;
     *) ARGS="--bm 128 --m 8192 --n 16384 --lanes 2 --nopipe --group 2"; K=k_gemmILi128ELi64ELi0ELb0E ;;
   esac
