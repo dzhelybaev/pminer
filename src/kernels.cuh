@@ -164,21 +164,22 @@ __device__ __forceinline__ void ldsm4(uint32_t &r0, uint32_t &r1, uint32_t &r2, 
                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(smem_u32(p)));
 }
 
-// D(16×8,s32) += A(16×32,s8) · B(32×8,s8)
+// D(16×8,s32) += A(16×32,s8) · B(32×8,s8). Без volatile: чистая операция над регистрами,
+// компилятор может переставлять mma относительно ldmatrix (те остаются volatile)
 __device__ __forceinline__ void mma16832(int *c, const uint32_t *a, uint32_t b0, uint32_t b1) {
 #if __CUDA_ARCH__ >= 800
-  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+  asm("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
                "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};\n"
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3])
                : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 #else  // Turing: 4 × m8n8k16 с теми же фрагментами
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
                : "+r"(c[0]), "+r"(c[1]) : "r"(a[0]), "r"(b0));
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
                : "+r"(c[0]), "+r"(c[1]) : "r"(a[2]), "r"(b1));
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
                : "+r"(c[2]), "+r"(c[3]) : "r"(a[1]), "r"(b0));
-  asm volatile("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
+  asm("mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 {%0,%1},{%2},{%3},{%0,%1};\n"
                : "+r"(c[2]), "+r"(c[3]) : "r"(a[3]), "r"(b1));
 #endif
 }
@@ -280,29 +281,37 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
     RegStage<SA, SB> rg;
     if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
 #endif
+    {  // два шага k32: сначала все ldmatrix обоих шагов, потом все mma
+      uint32_t af[2][4][4], bf[2][8][2];
 #pragma unroll
-    for (int ks = 0; ks < 2; ks++) {  // два шага k32 в стадии
-      uint32_t af[4][4], bf[8][2];
+      for (int ks = 0; ks < 2; ks++) {
 #pragma unroll
-      for (int i = 0; i < 4; i++)
-        ldsm4(af[i][0], af[i][1], af[i][2], af[i][3], &sA[st][sw(wm + 16 * i + a_row, 2 * ks + a_seg)]);
+        for (int i = 0; i < 4; i++)
+          ldsm4(af[ks][i][0], af[ks][i][1], af[ks][i][2], af[ks][i][3],
+                &sA[st][sw(wm + 16 * i + a_row, 2 * ks + a_seg)]);
 #pragma unroll
-      for (int j = 0; j < 4; j++)
-        ldsm4(bf[2 * j][0], bf[2 * j][1], bf[2 * j + 1][0], bf[2 * j + 1][1],
-              &sB[st][sw(wn + 16 * j + b_row, 2 * ks + b_seg)]);
+        for (int j = 0; j < 4; j++)
+          ldsm4(bf[ks][2 * j][0], bf[ks][2 * j][1], bf[ks][2 * j + 1][0], bf[ks][2 * j + 1][1],
+                &sB[st][sw(wn + 16 * j + b_row, 2 * ks + b_seg)]);
+      }
 #pragma unroll
-      for (int i = 0; i < 4; i++)
+      for (int ks = 0; ks < 2; ks++)
 #pragma unroll
-        for (int j = 0; j < 8; j++) mma16832(acc[i][j], af[i], bf[j][0], bf[j][1]);
+        for (int i = 0; i < 4; i++)
+#pragma unroll
+          for (int j = 0; j < 8; j++) mma16832(acc[i][j], af[ks][i], bf[ks][j][0], bf[ks][j][1]);
     }
     if ((kt + 1) % per_chunk == 0) {  // конец чанка r: XOR тайла, rotl13, сдвиг jackpot
-      uint32_t x = 0;
+      uint32_t xp[4];  // XOR деревом: 4 независимые цепочки вместо одной длинной
 #pragma unroll
-      for (int i = 0; i < 4; i++)
+      for (int c = 0; c < 4; c++) {
+        xp[c] = 0;
 #pragma unroll
-        for (int j = 0; j < 8; j++)
+        for (int i = 0; i < 4; i++)
 #pragma unroll
-          for (int c = 0; c < 4; c++) x ^= (uint32_t)acc[i][j][c];
+          for (int j = 0; j < 8; j++) xp[c] ^= (uint32_t)acc[i][j][c];
+      }
+      uint32_t x = (xp[0] ^ xp[1]) ^ (xp[2] ^ xp[3]);
       uint32_t nv = ((jp[0] << 13) | (jp[0] >> 19)) ^ x;
 #pragma unroll
       for (int i = 0; i < 15; i++) jp[i] = jp[i + 1];
