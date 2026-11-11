@@ -3,6 +3,7 @@
 // Попытка = новый чанк 0 матрицы A → пересчёт корня A (дерево blake3), сиды,
 // шум A на GPU, NoisyGEMM m×n×k с jackpot и проверкой границы в эпилоге.
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -60,7 +61,7 @@ struct Miner {
   Gpu *g = nullptr;
   int m = 0, n = 0, smem = 0, bm = 128, lanes = LANES;
   const int k = pearl::K, r = pearl::R;
-  static const int LANES = 2, MAX_HITS = 64, BATCH = 8;
+  static const int LANES = 2, MAX_HITS = 64, BATCH = 64;  // BATCH — максимум слотов пакета
   Lane ln[LANES];
   int8_t *dB = nullptr, *dBp = nullptr, *dE = nullptr;
   unsigned *dCount = nullptr;  // счётчик удач на слот пакета
@@ -265,29 +266,35 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   // автонастройка: ~1 с майнинга на каждом кандидате, берём лучший
   Cand best = cands[0];
   double best_hs = -1;
+  int best_bs = 8;
   for (const Cand &c : cands) {
     if (!mn.alloc(c.m, c.n, c.lanes, c.bm) || !mn.job(hdr)) { mn.release(); g->state = 0; continue; }
     unsigned h = 0;
-    mn.batch(nonce, ngpu, Miner::BATCH, h);  // прогрев
-    nonce += (uint64_t)ngpu * Miner::BATCH;
+    int bs = 8;
+    auto tw = std::chrono::steady_clock::now();
+    mn.batch(nonce, ngpu, bs, h);  // прогрев и оценка времени попытки
+    nonce += (uint64_t)ngpu * bs;
+    double ta = std::chrono::duration<double>(std::chrono::steady_clock::now() - tw).count() / bs;
+    // пакет ~8 мс: пробуждение спящего потока CPU после пакета (~0.1 мс) не заметно
+    bs = std::max(2, std::min(Miner::BATCH, (int)(0.008 / ta) + 1));
     int it = 0;
     auto t0 = std::chrono::steady_clock::now();
     double sec = 0;
     bool ok = true;
-    while (sec < 1.0 && (ok = mn.batch(nonce, ngpu, Miner::BATCH, h))) {
-      nonce += (uint64_t)ngpu * Miner::BATCH;
-      it += Miner::BATCH;
+    while (sec < 1.5 && (ok = mn.batch(nonce, ngpu, bs, h))) {
+      nonce += (uint64_t)ngpu * bs;
+      it += bs;
       sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     }
     double hs = ok ? (double)c.m * c.n * pearl::K * it / sec : 0;
-    LOG("GPU%d тест: блок %d m=%d n=%d полос %d → %.2f TH/s\n", g->id, c.bm, c.m, c.n, c.lanes, hs / 1e12);
-    if (hs > best_hs) { best_hs = hs; best = c; }
+    LOG("GPU%d тест: блок %d m=%d n=%d полос %d пакет %d → %.2f TH/s\n", g->id, c.bm, c.m, c.n, c.lanes, bs, hs / 1e12);
+    if (hs > best_hs) { best_hs = hs; best = c; best_bs = bs; }
     mn.release();
     g->state = 0;
   }
   if (best_hs <= 0 || !mn.alloc(best.m, best.n, best.lanes, best.bm) || !mn.job(hdr)) { g->state = -1; return; }
-  LOG("GPU%d выбрано: блок %d m=%d n=%d полос %d (L2 %d МБ)\n", g->id, best.bm, best.m, best.n, best.lanes,
-      p.l2CacheSize >> 20);
+  LOG("GPU%d выбрано: блок %d m=%d n=%d полос %d пакет %d (L2 %d МБ)\n", g->id, best.bm, best.m, best.n, best.lanes,
+      best_bs, p.l2CacheSize >> 20);
   o.m = best.m; o.n = best.n;
   if (best.bm == 128) {  // диагностика узких мест GEMM на выбранных размерах
     uint8_t sd[32] = {1};
@@ -306,10 +313,10 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   int it = 0;
   while (true) {
     unsigned h = 0;
-    if (!mn.batch(nonce, ngpu, Miner::BATCH, h)) break;
-    nonce += (uint64_t)ngpu * Miner::BATCH;
+    if (!mn.batch(nonce, ngpu, best_bs, h)) break;
+    nonce += (uint64_t)ngpu * best_bs;
     g->hits += h;
-    it += Miner::BATCH;
+    it += best_bs;
     double sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     if (sec >= 2.0) {
       g->hs = mac * it / sec;
