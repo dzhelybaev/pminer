@@ -118,10 +118,8 @@ struct Miner {
     pearl::fill(A, (uint32_t)seedA);
     pearl::fill(B, (uint32_t)seedB);
     treeA.build((const uint8_t *)A.data(), A.size(), jk);
-    b3::Pow2Tree treeB;
-    treeB.build((const uint8_t *)B.data(), B.size(), jk);
-    uint8_t hb[32];
-    treeB.root_with_chunk0((const uint8_t *)B.data(), hb);
+    uint8_t hb[32];  // n — любое кратное 128, поэтому общий хэш, а не дерево степени двойки
+    b3::hash_large((const uint8_t *)B.data(), B.size(), jk, hb);
     pearl::seed_b(jk, hb, n, bseed);
     CK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
     kern::Seed s = to_seed(bseed);
@@ -233,11 +231,22 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   // кандидаты (bm, m, n, полосы). L2-карты: всё должно жить в L2 (A' на полосу + B')
   struct Cand { int bm, m, n, lanes; };
   std::vector<Cand> cands;
+  // n, при котором число блоков (m/128)·(n/128) кратно числу мест (2 блока на SM) —
+  // последняя волна блоков заполнена целиком; ближайшее к target
+  const int slots = 2 * p.multiProcessorCount;
+  auto aligned_n = [&](int m, int target) {
+    int rows = m / 128, g0 = rows, b = slots;
+    while (b) { int t2 = g0 % b; g0 = b; b = t2; }
+    int c0 = slots / g0, q = (target / 128 + c0 / 2) / c0;
+    return 128 * c0 * (q < 1 ? 1 : q);
+  };
   if (o.m && o.n && o.lanes && o.bm) cands.push_back({o.bm, o.m, o.n, o.lanes});
   else if (big_l2)
-    cands = {{128, 1024, 2048, 2}, {128, 1024, 4096, 2}, {128, 512, 4096, 2}, {128, 2048, 2048, 1}};
+    cands = {{128, 2048, aligned_n(2048, 2048), 1}, {128, 1024, aligned_n(1024, 2048), 2},
+             {128, 1024, aligned_n(1024, 3072), 2}, {128, 2048, 2048, 1}, {128, 1024, 4096, 2},
+             {128, 512, 4096, 2}};
   else
-    cands = {{128, 8192, 16384, 2}, {128, 8192, 16384, 1}};
+    cands = {{128, 8192, 16384, 2}, {128, 4096, 8192, 2}, {128, 8192, aligned_n(8192, 16384), 2}};
   // блок 256 по замерам v0.6 всегда хуже — только вручную (--bm 256)
   Miner mn;
   mn.g = g;
@@ -318,8 +327,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--bm") && i + 1 < argc) o.bm = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--selftest")) o.selftest_only = true;
   }
-  if (o.m % 256 || o.n % 128 || (o.bm && o.bm != 128 && o.bm != 256) || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || (o.n & (o.n - 1)) || o.m < 0 || o.n < 0) {
-    fprintf(stderr, "pminer: --m (≥256), --n (≥128) — степени двойки; --bm 128|256; --lanes 1|2\n");
+  if (o.m % 256 || o.n % 128 || (o.bm && o.bm != 128 && o.bm != 256) || o.lanes < 0 || o.lanes > 2 || (o.m & (o.m - 1)) || o.m < 0 || o.n < 0) {
+    fprintf(stderr, "pminer: --m (≥256) — степень двойки, --n — кратно 128; --bm 128|256; --lanes 1|2\n");
     return 1;
   }
   printf("pminer %s: pearlhash dense V3, k=%d r=%d тайл %dx%d, nbits=%08x (тест, без пула)\n",

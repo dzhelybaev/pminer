@@ -16,6 +16,9 @@ int main() {
     t.root_with_chunk0(d.data(), out); char n[32]; snprintf(n, 32, "tree%zu", ch); hex(n, out, 32);
     t.root_with_chunk0(d.data() + 50000, out); snprintf(n, 32, "treex%zu", ch); hex(n, out, 32);
   }
+  for (size_t len : {2048, 3072, 5 * 1024, 7 * 1024 + 100, 15 * 1024, 60 * 1024}) {
+    b3::hash_large(d.data(), len, key, out); char n[32]; snprintf(n, 32, "large%zu", len); hex(n, out, 32);
+  }
   pearl::Header h; for (int i = 0; i < 32; i++) { h.prev_block[i] = i; h.merkle_root[i] = 0x80 + i; }
   h.timestamp = 0x6a000000; h.nbits = 0x1e100000;
   uint8_t hb[76]; pearl::header_bytes(h, hb); hex("header", hb, 76);

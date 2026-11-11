@@ -103,6 +103,36 @@ inline void hash_small(const uint8_t *data, size_t len, const uint8_t *key, uint
   store_words(o, out, 8);
 }
 
+// Хэш произвольной длины (стандартный стек CV из спецификации BLAKE3). key==nullptr — обычный.
+inline void hash_large(const uint8_t *data, size_t len, const uint8_t *key, uint8_t out[32]) {
+  if (len <= CHUNK) { hash_small(data, len, key, out); return; }
+  uint32_t k[8], kf = key ? KEYED : 0;
+  if (key) load_words(key, k, 8); else memcpy(k, IV, 32);
+  size_t nch = (len + CHUNK - 1) / CHUNK;
+  std::vector<std::array<uint32_t, 8>> stack;
+  for (size_t c = 0; c + 1 < nch; c++) {
+    std::array<uint32_t, 8> cv;
+    chunk_cv(k, kf, data + c * CHUNK, CHUNK, c, false, cv.data());
+    uint64_t total = c + 1;
+    while ((total & 1) == 0) {
+      std::array<uint32_t, 8> l = stack.back();
+      stack.pop_back();
+      parent_cv(k, kf, l.data(), cv.data(), false, cv.data());
+      total >>= 1;
+    }
+    stack.push_back(cv);
+  }
+  uint32_t cv[8];
+  size_t last = (nch - 1) * CHUNK;
+  chunk_cv(k, kf, data + last, len - last, nch - 1, false, cv);
+  while (!stack.empty()) {
+    std::array<uint32_t, 8> l = stack.back();
+    stack.pop_back();
+    parent_cv(k, kf, l.data(), cv, stack.empty(), cv);
+  }
+  store_words(cv, out, 8);
+}
+
 // Дерево BLAKE3 для числа чанков — степени двойки (≥1). Хранит CV правых соседей
 // левой ветви, чтобы быстро пересчитывать корень при изменении чанка 0.
 struct Pow2Tree {

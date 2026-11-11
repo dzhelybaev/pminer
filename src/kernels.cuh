@@ -301,8 +301,19 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
 #else
     constexpr int SA = BM * 4 / NTHR, SB = BN * 4 / NTHR;
     [[maybe_unused]] RegStage<SA, SB> rg;
-    if constexpr (MODE < 1)
+    if constexpr (MODE < 1) {
       if (nk < KT) load_regs<NTHR>(rg, gA + nk * BK, gB + nk * BK, k, t);
+      // подкачка в L2 стадии через одну: к её загрузке в регистры данные уже не в DRAM.
+      // Строка тайла — 64 байта в одной строке кэша 128 Б: префетч раз на две стадии
+      if (((nk + 1) & 1) == 0 && nk + 1 < KT && (t & 3) == 0) {
+#pragma unroll
+        for (int i = 0; i < SA; i++)
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(gA + (size_t)((t + i * NTHR) >> 2) * k + (nk + 1) * BK));
+#pragma unroll
+        for (int i = 0; i < SB; i++)
+          asm volatile("prefetch.global.L2 [%0];" ::"l"(gB + (size_t)((t + i * NTHR) >> 2) * k + (nk + 1) * BK));
+      }
+    }
 #endif
     {  // два шага k32: сначала все ldmatrix обоих шагов, потом все mma
       if constexpr (MODE < 3) load_frags(st);

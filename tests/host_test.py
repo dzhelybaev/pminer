@@ -25,6 +25,8 @@ for n in [0, 1, 63, 64, 65, 128, 1000, 1024]:
 for ch in [1, 2, 64]:
     exp[f"tree{ch}"] = blake3(d[:ch * 1024], key=key).hexdigest()
     exp[f"treex{ch}"] = blake3(d[50000:51024] + d[1024:ch * 1024], key=key).hexdigest()
+for n in [2048, 3072, 5 * 1024, 7 * 1024 + 100, 15 * 1024, 60 * 1024]:
+    exp[f"large{n}"] = blake3(d[:n], key=key).hexdigest()
 rows, cols = R.Pattern(list(range(0, 64, 8))), R.Pattern([j + b for j in range(0, 64, 8) for b in (0, 1)])
 hdr = R.header_bytes(1, bytes(range(32)), bytes(0x80 + i for i in range(32)), 0x6a000000, 0x1e100000)
 exp["header"] = hdr.hex()
