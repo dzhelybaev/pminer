@@ -40,6 +40,9 @@ exp["seed_a"] = R.bk(bs + ha).hex()
 for nb in [0x1e100000, 0x1c020000, 0x2000013b, 0x03123456, 0x02123456, 0x2100ffff]:
     exp[f"bound{nb:08x}"] = R.bound(nb, 8, 16, 4096, 128).to_bytes(32, "little").hex()
 exp["chunk0"] = bytes(((splitmix(5 + 3 * 1024 + i) % 129) - 64) & 255 for i in range(16)).hex()
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ref"))
+import selftest_gen as S  # noqa: E402
+exp["gen"] = S.gen(0xA11CE, 0, 64).tobytes().hex()
 bad = [k for k in exp if got.get(k) != exp[k]]
 for k in bad:
     print("FAIL", k, got.get(k), exp[k])

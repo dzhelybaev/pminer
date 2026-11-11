@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include "blake3.h"
+#include "pearl.h"
 
 namespace kern {
 
@@ -80,6 +81,36 @@ __global__ void k_apply(int8_t *dst, const int8_t *src, const int8_t *E, const u
   }
 }
 
+// A'[i][l] = A[i][l] + шум, где A не хранится: чанк 0 (первые 1024 байта) — из c0,
+// остальное — pearl::gen_val(seed, i*k+l). Убирает буфер A (8–32 МБ) из L2/DRAM.
+__global__ void k_apply_gen(int8_t *dst, const int8_t *c0, uint32_t seed, const int8_t *E, const uint8_t *first,
+                            const uint8_t *second, int k, int r) {
+  extern __shared__ int8_t e_row[];
+  size_t row = blockIdx.x;
+  for (int c = threadIdx.x; c < r; c += blockDim.x) e_row[c] = E[row * r + c];
+  __syncthreads();
+  char4 *d4 = (char4 *)(dst + row * k);
+  const uchar4 *f4 = (const uchar4 *)first, *g4 = (const uchar4 *)second;
+  for (int q = threadIdx.x; q < k / 4; q += blockDim.x) {
+    uint32_t idx = (uint32_t)(row * k) + 4 * q;
+    int8_t a[4];
+    if (idx < 1024) {
+      char4 v = ((const char4 *)c0)[idx / 4];
+      a[0] = v.x; a[1] = v.y; a[2] = v.z; a[3] = v.w;
+    } else {
+#pragma unroll
+      for (int e = 0; e < 4; e++) a[e] = pearl::gen_val(seed, idx + e);
+    }
+    uchar4 f = f4[q], g = g4[q];
+    char4 o;
+    o.x = (int8_t)(a[0] + e_row[f.x] - e_row[g.x]);
+    o.y = (int8_t)(a[1] + e_row[f.y] - e_row[g.y]);
+    o.z = (int8_t)(a[2] + e_row[f.z] - e_row[g.z]);
+    o.w = (int8_t)(a[3] + e_row[f.w] - e_row[g.w]);
+    d4[q] = o;
+  }
+}
+
 // ---------------- NoisyGEMM ----------------
 // Блок 128×128, 4 warp по 64×64, шаг K 64 байта, 2 стадии smem.
 // Поток warp держит 4×8 фрагментов m16n8 = 128 аккумуляторов = ровно один тайл
@@ -151,6 +182,25 @@ __device__ __forceinline__ void load_tile(int8_t *s, const int8_t *g, int k, int
   }
 }
 
+// Turing: следующая стадия грузится в регистры до вычислений и кладётся в smem после
+struct RegStage { uint4 a[4], b[4]; };
+__device__ __forceinline__ void load_regs(RegStage &rg, const int8_t *gA, const int8_t *gB, int k, int t) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
+    rg.a[i] = *(const uint4 *)(gA + (size_t)row * k + seg * 16);
+    rg.b[i] = *(const uint4 *)(gB + (size_t)row * k + seg * 16);
+  }
+}
+__device__ __forceinline__ void store_regs(const RegStage &rg, int8_t *sA, int8_t *sB, int t) {
+#pragma unroll
+  for (int i = 0; i < 4; i++) {
+    int idx = t + i * NTHR, row = idx >> 2, seg = idx & 3;
+    *(uint4 *)(sA + sw(row, seg)) = rg.a[i];
+    *(uint4 *)(sB + sw(row, seg)) = rg.b[i];
+  }
+}
+
 // A' (m×k), B'^T (n×k): int8, k-непрерывные. k кратно BK, r кратно BK.
 // Сетка одномерная, порядок блоков сгруппирован по GROUP_M строк блоков —
 // одновременно работающие блоки делят панели A и B в L2.
@@ -194,11 +244,14 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
   for (int kt = 0; kt < KT; kt++) {
     cp_wait<STAGES - 2>();
     __syncthreads();  // стадия kt готова; буфер стадии kt-1 больше никто не читает
-    {
-      int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
-      if (nk < KT) { load_tile(sA[ns], gA + nk * BK, k, t); load_tile(sB[ns], gB + nk * BK, k, t); }
-      cp_commit();
-    }
+    const int nk = kt + STAGES - 1, ns = st == 0 ? STAGES - 1 : st - 1;
+#if __CUDA_ARCH__ >= 800
+    if (nk < KT) { load_tile(sA[ns], gA + nk * BK, k, t); load_tile(sB[ns], gB + nk * BK, k, t); }
+    cp_commit();
+#else
+    RegStage rg;
+    if (nk < KT) load_regs(rg, gA + nk * BK, gB + nk * BK, k, t);
+#endif
 #pragma unroll
     for (int ks = 0; ks < 2; ks++) {  // два шага k32 в стадии
       uint32_t af[4][4], bf[8][2];
@@ -227,6 +280,9 @@ k_gemm(const int8_t *__restrict__ A, const int8_t *__restrict__ Bt, int m, int n
       for (int i = 0; i < 15; i++) jp[i] = jp[i + 1];
       jp[15] = nv;
     }
+#if __CUDA_ARCH__ < 800
+    if (nk < KT) store_regs(rg, sA[ns], sB[ns], t);
+#endif
     st = st == STAGES - 1 ? 0 : st + 1;
   }
 

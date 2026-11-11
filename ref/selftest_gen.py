@@ -26,10 +26,22 @@ def rnd(seed, start, count):
     return ((splitmix_arr(seed + start, count) % np.uint64(129)).astype(np.int16) - 64).astype(np.int8)
 
 
+def gen(seed, start, count):
+    """murmur3 fmix32 от idx*0x9E3779B1+seed, сужение ((x>>8)*129)>>24 - 64 (как pearl::gen_val)."""
+    M32 = np.uint32(0xFFFFFFFF)
+    x = (np.arange(start, start + count, dtype=np.uint64) * np.uint64(0x9E3779B1) + np.uint64(seed)) & np.uint64(M32)
+    x ^= x >> np.uint64(16)
+    x = (x * np.uint64(0x85EBCA6B)) & np.uint64(M32)
+    x ^= x >> np.uint64(13)
+    x = (x * np.uint64(0xC2B2AE35)) & np.uint64(M32)
+    x ^= x >> np.uint64(16)
+    return ((((x >> np.uint64(8)) * np.uint64(129)) >> np.uint64(24)).astype(np.int16) - 64).astype(np.int8)
+
+
 def matrices(nonce=0):
-    a = rnd(SEED_A, 0, M * K)
-    a[:1024] = rnd(SEED_N, nonce * 1024, 1024)
-    bt = rnd(SEED_B, 0, N * K)
+    a = gen(SEED_A, 0, M * K)
+    a[:1024] = rnd(SEED_N, nonce * 1024, 1024)  # чанк 0 — splitmix от nonce
+    bt = gen(SEED_B, 0, N * K)
     return a.reshape(M, K), bt.reshape(N, K)
 
 

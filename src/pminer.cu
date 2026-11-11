@@ -69,7 +69,7 @@ struct Miner {
   bool alloc(int m_, int n_) {
     m = m_; n = n_;
     size_t big = (size_t)(m > n ? m : n);
-    CK(cudaMalloc(&dA, (size_t)m * k));
+    CK(cudaMalloc(&dA, 1024));  // только чанк 0; остальное A генерируется в k_apply_gen
     CK(cudaMalloc(&dAp, (size_t)m * k));
     CK(cudaMalloc(&dB, (size_t)n * k));
     CK(cudaMalloc(&dBp, (size_t)n * k));
@@ -90,12 +90,14 @@ struct Miner {
     if (hCount) cudaFreeHost(hCount);
   }
 
+  // isA: dst = A' из генератора (seedA) и чанка 0 в dA; иначе dst = src + шум
   bool noise(int8_t *dst, const int8_t *src, int rows, const uint8_t seed[32], bool isA) {
     kern::Seed s = to_seed(seed);
     int nh = rows * r / 32;
     kern::k_uniform<<<(nh + 255) / 256, 256>>>(dE, rows, r, s, isA);
     kern::k_perm<<<((k + 7) / 8 + 127) / 128, 128>>>(dF, dS, k, r, s, isA);
-    kern::k_apply<<<rows, 256, r>>>(dst, src, dE, dF, dS, k, r);
+    if (isA) kern::k_apply_gen<<<rows, 256, r>>>(dst, dA, (uint32_t)seedA, dE, dF, dS, k, r);
+    else kern::k_apply<<<rows, 256, r>>>(dst, src, dE, dF, dS, k, r);
     CK(cudaGetLastError());
     return true;
   }
@@ -107,15 +109,14 @@ struct Miner {
     pearl::bound(h.nbits, bw);
     memcpy(bnd.w, bw, 32);
     std::vector<int8_t> A((size_t)m * k), B((size_t)n * k);
-    pearl::fill(A, seedA);
-    pearl::fill(B, seedB);
+    pearl::fill(A, (uint32_t)seedA);
+    pearl::fill(B, (uint32_t)seedB);
     treeA.build((const uint8_t *)A.data(), A.size(), jk);
     b3::Pow2Tree treeB;
     treeB.build((const uint8_t *)B.data(), B.size(), jk);
     uint8_t hb[32];
     treeB.root_with_chunk0((const uint8_t *)B.data(), hb);
     pearl::seed_b(jk, hb, n, bseed);
-    CK(cudaMemcpy(dA, A.data(), A.size(), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dB, B.data(), B.size(), cudaMemcpyHostToDevice));
     if (!noise(dBp, dB, n, bseed, false)) return false;
     CK(cudaDeviceSynchronize());
@@ -130,7 +131,7 @@ struct Miner {
     treeA.root_with_chunk0((const uint8_t *)c0, ha);
     pearl::seed_a(bseed, ha, m, aseed);
     CK(cudaMemcpyAsync(dA, c0, 1024, cudaMemcpyHostToDevice));
-    if (!noise(dAp, dA, m, aseed, true)) return false;
+    if (!noise(dAp, nullptr, m, aseed, true)) return false;
     CK(cudaMemsetAsync(dCount + slot, 0, sizeof(unsigned)));
     if (with_digest) CK(cudaMemsetAsync(dDigest, 0, 32));
     int blocks = (m / kern::BM) * (n / kern::BN);
@@ -201,6 +202,25 @@ static void worker(Gpu *g, Opts o, int ngpu) {
   LOG("GPU%d задача готова за %.1f с (m=%d n=%d k=%d, L2 %d МБ)\n", g->id,
       std::chrono::duration<double>(std::chrono::steady_clock::now() - t_job).count(), o.m, o.n, pearl::K,
       p.l2CacheSize >> 20);
+  {  // замер фаз: GEMM отдельно и шум A отдельно
+    cudaEvent_t e0, e1;
+    cudaEventCreate(&e0); cudaEventCreate(&e1);
+    uint8_t sd[32] = {1};
+    const int N = 20;
+    float tg = 0, tn = 0;
+    mn.noise(mn.dAp, nullptr, o.m, sd, true);
+    cudaEventRecord(e0);
+    for (int i = 0; i < N; i++)
+      kern::k_gemm<<<(o.m / kern::BM) * (o.n / kern::BN), kern::NTHR>>>(mn.dAp, mn.dBp, o.m, o.n, pearl::K, pearl::R,
+                                                                     to_seed(sd), mn.bnd, mn.dCount, mn.dHits, 0, nullptr);
+    cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&tg, e0, e1);
+    cudaEventRecord(e0);
+    for (int i = 0; i < N; i++) mn.noise(mn.dAp, nullptr, o.m, sd, true);
+    cudaEventRecord(e1); cudaEventSynchronize(e1); cudaEventElapsedTime(&tn, e0, e1);
+    double mac1 = (double)o.m * o.n * pearl::K;
+    LOG("GPU%d замер: GEMM %.3f мс (%.2f TH/s), шум A %.3f мс\n", g->id, tg / N, mac1 / (tg / N * 1e-3) / 1e12, tn / N);
+    cudaEventDestroy(e0); cudaEventDestroy(e1);
+  }
   g->state = 1;
   const double mac = (double)o.m * o.n * pearl::K;
   uint64_t nonce = 1 + g->id;

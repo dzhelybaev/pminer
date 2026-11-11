@@ -28,4 +28,5 @@ int main() {
     char n[32]; snprintf(n, 32, "bound%08x", nb); hex(n, bb, 32);
   }
   int8_t c0[1024]; pearl::chunk0(5, 3, c0); hex("chunk0", (uint8_t *)c0, 16);
+  std::vector<int8_t> g(64); pearl::fill(g, 0xA11CEu); hex("gen", (uint8_t *)g.data(), 64);
 }

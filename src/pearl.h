@@ -93,8 +93,14 @@ inline uint64_t splitmix(uint64_t z) {
 }
 inline int8_t rnd_val(uint64_t seed, uint64_t i) { return (int8_t)((int)(splitmix(seed + i) % 129) - 64); }
 
-inline void fill(std::vector<int8_t> &v, uint64_t seed) {
-  for (size_t i = 0; i < v.size(); i++) v[i] = rnd_val(seed, i);
+// дешёвый генератор базовых матриц (host и GPU одинаково): murmur3 fmix32 + сужение до [-64,64]
+__host__ __device__ __forceinline__ int8_t gen_val(uint32_t seed, uint32_t idx) {
+  uint32_t x = idx * 0x9E3779B1u + seed;
+  x ^= x >> 16; x *= 0x85EBCA6Bu; x ^= x >> 13; x *= 0xC2B2AE35u; x ^= x >> 16;
+  return (int8_t)((int)(((x >> 8) * 129u) >> 24) - 64);
+}
+inline void fill(std::vector<int8_t> &v, uint32_t seed) {
+  for (size_t i = 0; i < v.size(); i++) v[i] = gen_val(seed, (uint32_t)i);
 }
 // чанк 0 матрицы A для номера попытки nonce
 inline void chunk0(uint64_t seed, uint64_t nonce, int8_t out[1024]) {
