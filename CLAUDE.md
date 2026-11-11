@@ -4,12 +4,21 @@
 Свой GPU-майнер Pearl под RTX 5060 (sm_120), 4060 (sm_89), 3060 (sm_86), 2060 Super (sm_75).
 Запуск через HiveOS «Custom miner».
 
-## Текущий этап (v0.1)
-Только бенчмарк INT8 tensor cores (mma.sync s8) на всех GPU; хэшрейт = MAC/s,
-что соответствует «TH/s» pearlhash (попытка 8×16×4096 = 524 288 MAC). Реального майнинга нет.
+## Текущий этап (v0.2)
+Настоящий pearlhash на GPU (dense, V3), но без пула: тестовый заголовок, nbits по умолчанию
+0x1c020000 (~1 «удача» на попытку). При старте каждая GPU проходит самотест против эталона
+(m=n=128): при FAIL карта не майнит (хэшрейт 0, в логе «selftest FAIL»).
+Хэшрейт = m·n·k / время попытки (MAC/s ≈ TH/s pearlhash).
+v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
 
 ## Структура
-- `src/pminer.cu` — бинарник: поток на GPU, ядро IMMA, stats.json для HiveOS
+- `src/pminer.cu` — main: поток на GPU, самотест, цикл попыток, stats.json для HiveOS
+- `src/kernels.cuh` — CUDA: k_uniform/k_perm/k_apply (шум), k_gemm (NoisyGEMM+jackpot+blake3)
+- `src/blake3.h` — BLAKE3 (host+device), дерево для степени двойки чанков
+- `src/pearl.h` — заголовок/конфиг, сиды V3, граница, ГПСЧ splitmix для матриц
+- `src/selftest.h` — ожидаемые значения самотеста (генерирует `ref/selftest_gen.py`)
+- `tests/host_test.cpp` + `tests/host_test.py` — сверка хостовой части с эталоном (без GPU):
+  `g++ -O2 -std=c++17 -Wno-unknown-pragmas -o /tmp/ht tests/host_test.cpp && /tmp/ht > /tmp/ht.txt && python3 tests/host_test.py /tmp/ht.txt`
 - `hiveos/` — h-manifest.conf, h-config.sh, h-run.sh, h-stats.sh
 - `build.sh` — сборка бинарника и пакета `dist/pminer-<ver>.tar.gz`
 - `dist/` — готовый пакет для HiveOS (коммитится, ссылка raw)
@@ -37,7 +46,7 @@ Flight Sheet → Miner: Custom → Setup:
 
 ## Известные проблемы
 - HiveOS, похоже, обрезает per-GPU хэшрейт в hs_units "hs" (показывал 1000.0) — отдаём в "mhs"
-- pminer v0.1 не подключается к пулу: любые сообщения пула не от него
+- pminer пока не подключается к пулу: любые сообщения пула не от него
 - Репозиторий публичный: нужен для скачивания пакета HiveOS по raw-ссылке
 
 ## Алгоритм pearlhash (проверено эталоном)
@@ -50,8 +59,19 @@ Flight Sheet → Miner: Custom → Setup:
 - удача: blake3_keyed(a_seed, jackpot) как LE-число <= target(nbits)·h·w·k
 - значит хэшрейт = MAC/s, а blake3 почти ничего не стоит — всё решает скорость GEMM
 
+## Устройство майнинга (v0.2)
+- конфиг: k=4096, r=128, rows [0,8,..,56], cols [0,1,8,9,..,56,57] — тайл 8×16 совпадает с
+  раскладкой аккумуляторов mma у одного потока warp (warp-тайл 64×64), XOR без обменов
+- B (n×k) фиксирована на задачу: шум B и B' считаются один раз
+- попытка: меняется только чанк 0 (1 КБ) матрицы A → корень A пересчитывается по
+  кэшу дерева за log2(чанков) компрессий; затем сид A, шум A на GPU, GEMM
+- k_gemm: блок 128×128, 4 warp, BK=64, 2 стадии, cp.async (sm80+) / синхронно (sm75),
+  ldmatrix + swizzle, mma m16n8k32 (Turing: 4× m8n8k16), эпилог: blake3 + сравнение с границей
+- параметры: --m 8192 --n 16384 (степени двойки), --nbits HEX, --selftest
+
 ## Бэклог
 1. ~~Эталон pearlhash на Python~~ — готов, совпадает с Rust-кодом Pearl
-2. CUDA: генерация шума, NoisyGEMM на mma.sync + ldmatrix/cp.async, jackpot, проверка таргета
+2. ~~CUDA-ядро v0.2~~ — проверить самотест и скорость на картах
+2a. Скорость: 3–4 стадии, BK=128, больше warp, перекрытие шума A с GEMM, двойной буфер A'
 3. Stratum-клиент пула, доказательства через zk-pow (Rust)
 4. Тюнинг под каждую архитектуру (Nsight Compute)
