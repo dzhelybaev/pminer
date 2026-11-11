@@ -26,6 +26,8 @@ v0.1 — только бенчмарк пика INT8 (ветка version/v0.1).
 - `tests/host_test.cpp` + `tests/host_test.py` — сверка хостовой части с эталоном (без GPU):
   `g++ -O2 -std=c++17 -Wno-unknown-pragmas -o /tmp/ht tests/host_test.cpp && /tmp/ht > /tmp/ht.txt && python3 tests/host_test.py /tmp/ht.txt`
 - `hiveos/` — h-manifest.conf, h-config.sh, h-run.sh, h-stats.sh
+- `tools/ncu.sh` — профиль k_gemm под Nsight Compute на риге (скачивает ncu 2025.2.1 в /root/ncu,
+  останавливает майнер, по одному запуску на карту с параметрами автонастройки → /root/ncu/gpuN.txt)
 - `build.sh` — сборка бинарника и пакета `dist/pminer-<ver>.tar.gz`
 - `dist/` — готовый пакет для HiveOS (коммитится, ссылка raw)
 - `ref/pearlhash_ref.py` — эталон pearlhash на numpy (dense, сертификат V3 salted)
@@ -192,7 +194,9 @@ Flight Sheet → Miner: Custom → Setup:
   начале итерации (до IMMA), STS — в конце, задержка спрятана. Остаётся пропускная способность
   DRAM (память 5000) — проверить на 7000. Итог 55.2 / 44.0 / 30.1 = 129.2 TH/s.
   Память 2060S 7000: 30.2 TH/s, диагностика 31.1|38.9|40.7|41.3 — без изменений → и не DRAM.
-  Остаток у Turing — сама перекладка global→регистры→smem (нет cp.async); точнее — только профилем
+  Остаток у Turing — сама перекладка global→регистры→smem (нет cp.async); точнее — только профилем.
+  Эпилог (blake3 на поток) по SASS sm_89 — ~650 инструкций на ~18 тыс. цикла на warp (~3.5%,
+  частично перекрыт вторым блоком SM); компрессия уже минимальна (SHF.W для rotr) — резерва почти нет
 - v0.17 микробенч (8/16/32 warp, постоянные/меняющиеся данные; ILP 1/4/8 при 8 warp):
   5060 75.2/73.5 при любом числе warp, ILP 70.8/73.5/73.5; 4060 63.4/61.8…62.9; 2060S 42.8/42.0 →
   43.7/42.8. Вывод: 8 warp на SM хватает, энергия данных −2%, ILP не важен. Значит, потеря в нашем
